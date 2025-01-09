@@ -1,0 +1,187 @@
+import itertools
+import os
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from models.membank_model import MemBankResNetLSTM
+
+
+def create_memorybank(
+    model: MemBankResNetLSTM,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    mb_path: str = "./cholec80_memory_bank.pkl",
+    device: torch.device = torch.device("cuda:0"),
+):
+
+    # create memory bank
+    if os.path.exists(mb_path):
+        print("Loading memory bank...")
+        with open(mb_path, "rb") as f:
+            memory_bank = torch.load(f)
+            train_mb = memory_bank["train"]
+            val_mb = memory_bank["val"]
+        print("Memory bank loaded!")
+    else:
+        print("Creating memory bank...")
+
+        # ensure train_loader is using the test transform (not the train transform)
+        train_loader.dataset.transform = val_loader.dataset.transform
+
+        train_mb = []
+        val_mb = []
+
+        # assuming already trained model and already in the correct device
+        # freezing
+        for params in model.parameters():
+            params.requires_grad = False
+        model.eval()
+
+        total_steps = len(train_loader) + len(val_loader)
+        bar = tqdm(total=total_steps)
+
+        loaders = [("train", train_loader), ("val", val_loader)]
+
+        with torch.no_grad():
+            batch: tuple[torch.Tensor, dict[str, torch.Tensor]]
+            for loader_name, curr_loader in loaders:
+                if loader_name == "train":
+                    mb = train_mb
+                else:
+                    mb = val_mb
+
+                for batch in curr_loader:
+                    inputs, meta = batch
+                    labels = meta["phase_label"]
+
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+
+                    outputs_feature: torch.Tensor = model.get_features(inputs)
+                    # outputs_feature has shape (batch_size*seq_len, 512)
+                    outputs_feature = outputs_feature.detach().cpu().numpy()
+                    for j in range(len(outputs_feature)):
+                        mb.append(outputs_feature[j].reshape(1, 512))
+                    bar.update(1)
+                print(f"{loader_name} MB feature length:", len(mb))
+        bar.close()
+        print("finish!")
+        train_mb = np.asarray(train_mb)
+        val_mb = np.asarray(val_mb)
+        memory_bank = {"train": train_mb, "val": val_mb}
+        with open(mb_path, "wb") as f:
+            torch.save(memory_bank, f)
+        print("Memory bank created!")
+
+    return train_mb, val_mb
+
+
+# def get_long_feature(start_index_list, dict_start_idx_LFB, lfb, LFB_length: int = 30):
+#     # lfb is the memorybank. Size is [num, 512], where num is the number of elements in the dataset
+#     # dict_start_idx_LFB is a dictionary of [int,int] from 0 to num-1
+#     # start_index_list is a list of int from 0 to num-1 subsampled every sequence_length
+#     """
+#     start_index_list: A list of integers representing the starting indices for the sequences to be extracted.
+#     dict_start_idx_LFB: A dictionary mapping each index to a corresponding index in the memory bank (lfb).
+#     lfb: The memory bank, which is a 2D tensor of size [num, 512], where num is the number of elements in the dataset, and each element has 512 features.
+#     """
+#     long_feature = []
+#     for j in range(len(start_index_list)):
+#         long_feature_each = []
+#         # 上一个存在feature的index
+#         last_LFB_index_no_empty = dict_start_idx_LFB[int(start_index_list[j])]
+#         for k in range(LFB_length):
+#             LFB_index = (start_index_list[j] - k - 1)
+#             if int(LFB_index) in dict_start_idx_LFB:
+#                 LFB_index = dict_start_idx_LFB[int(LFB_index)]
+#                 long_feature_each.append(lfb[LFB_index])
+#                 last_LFB_index_no_empty = LFB_index
+#             else:
+#                 long_feature_each.append(lfb[last_LFB_index_no_empty])
+#         long_feature.append(long_feature_each)
+#     return long_feature
+
+
+def get_long_range_feature_clip(inputs: torch.Tensor, metadata: dict[str, torch.Tensor], MB: torch.Tensor, L: int = 30):
+    """
+    Generate the long-range feature clip using precomputed features in MB.
+
+    Args:
+        inputs (torch.Tensor): Input tensor of shape [B, T, C, H, W].
+        metadata (list of dict): Metadata for each sequence in the batch.
+        MB (torch.Tensor): Memory bank of pre-extracted features of shape [N, 512].
+        L (int): Length of the temporal window in seconds.
+
+    Returns:
+        torch.Tensor: Long-range feature clip of shape [B, L, 512].
+    """
+    B, T, C, H, W = inputs.size()  # Get batch size from inputs
+    feature_dim = MB.size(-1)  # Dimensionality of the features (512)
+
+    # Initialize the output memory bank for long-range features
+    long_range_features = torch.zeros(B, L, feature_dim, device=inputs.device)
+
+    # Populate the long-range features using frames_indexes from metadata
+    for i, meta in enumerate(metadata):
+        frame_indexes = meta["fames_indexes"]  # List of frame indexes associated with MB
+        start_idx = max(0, len(frame_indexes) - L)  # Consider only the last L indexes
+
+        # Fill the memory bank for the current batch item
+        for j, idx in enumerate(frame_indexes[start_idx:]):
+            if idx < MB.size(0):  # Ensure index is within bounds of MB
+                long_range_features[i, j] = MB[idx]
+
+    return long_range_features  # Shape: [B, L, 512]
+
+
+def __test_mb_creation__():
+    device = torch.device("cuda:0")
+    model = MemBankResNetLSTM(10).to(device)
+
+    class FakeDataset(torch.utils.data.Dataset):
+        def __init__(self, length):
+            self.length = length
+
+        def __len__(self):
+            return self.length
+
+        def __getitem__(self, idx):
+            return torch.randn(10, 3, 224, 224), {"phase_label": torch.tensor(1)}
+
+    train_loader = DataLoader(FakeDataset(50), batch_size=12)
+    val_loader = DataLoader(FakeDataset(10), batch_size=12)
+
+    out = "dummy_output.pkl"
+    if os.path.exists(out):
+        os.remove(out)
+    memory_bank = create_memorybank(model=model, train_loader=train_loader, val_loader=val_loader, mb_path=out)
+    os.remove(out)
+
+
+def __test_long_features__():
+    # Example input dimensions
+    B, T, C, H, W = 40, 10, 3, 224, 224
+    N = 1000  # Total number of features in memory bank
+    L = 30  # Temporal length of the long-range feature clip
+    
+    inputs = torch.randn(B, T, C, H, W)  # Random input for testing
+    MB = torch.randn(N, 512)  # Precomputed memory bank features
+    
+    metadata = [
+        {
+            "video_name": f"video_{i}",
+            "frames_filepath": [f"frame_{j}.jpg" for j in range(T)],
+            "fames_indexes": list(range(i * T, i * T + T)),  # Map to MB indexes
+            "phase_label": "some_label",
+            "phase_label_dense": ["phase_label"] * T,
+        }
+        for i in range(B)
+    ]
+    
+    long_range_features = get_long_range_feature_clip(inputs, metadata, MB, L=L)
+    print(long_range_features.shape)  # Expected: [40, 30, 512]
+
+if __name__ == "__main__":
+    # __test_mb_creation__()
+    __test_long_features__()
