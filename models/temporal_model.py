@@ -33,7 +33,7 @@ class TemporalResNetLSTM(nn.Module):
         init.xavier_uniform_(self.fc_h_c.weight)
         init.xavier_uniform_(self.fc_anticipation.weight)
 
-    def forward(self, x: torch.Tensor, mb_features: torch.Tensor):
+    def get_features(self, x: torch.Tensor):
         # Extract features from the backbone
         x = x.view(-1, 3, 224, 224)
         x = self.backbone.forward(x)
@@ -44,6 +44,11 @@ class TemporalResNetLSTM(nn.Module):
         y, _ = self.lstm(x)
         y = y.contiguous().view(-1, 512)
         y = y[self.sequence_length - 1 :: self.sequence_length]  # Use the last hidden state for the sequence
+
+        return y
+
+    def forward(self, x: torch.Tensor, mb_features: torch.Tensor):
+        y = self.get_features(x)
 
         # Long-range features via time convolution
         Lt = self.time_conv(mb_features)

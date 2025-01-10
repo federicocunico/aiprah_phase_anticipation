@@ -2,6 +2,7 @@ import itertools
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from models.membank_model import MemBankResNetLSTM
@@ -103,6 +104,47 @@ def create_memorybank(
 #     return long_feature
 
 
+def get_long_range_feature_clip_online(model: torch.nn.Module, inputs: torch.Tensor, MB: torch.Tensor, L: int = 30):
+    ## MB is just the memory bank features. But in testing we are running online mode.
+    # To compensate this, we want to find which is the sequence of T consecutive frames
+    # in MB that is the most similar to the current sequence of T frames in inputs.
+    # This is done by computing the cosine similarity between the current sequence of T frames
+    # in inputs and all the sequences of T frames in MB.
+    # Output shape # Shape: [B, L, 512]
+
+    if not hasattr(model, "get_features"):
+        raise ValueError("Model does not have get_features method.")
+
+    # Extract features from the current sequence of inputs
+    current_feature: torch.Tensor = model.get_features(inputs)
+    current_feature = current_feature # .detach().cpu()  # Shape: [B, nfeats]
+    MB = MB.squeeze()  # Shape: [N, nfeats]
+
+    # Generate all possible T-length sequences in MB
+    B, T, C, H, W = inputs.size()
+    MB_windows = MB.unfold(0, T, 1).permute(0, 2, 1)  # Shape: [N-T+1, T, F]
+
+    # Normalize MB_windows and current_feature for cosine similarity
+    MB_windows = F.normalize(MB_windows, dim=-1)  # Normalize along feature dimension
+    current_feature = F.normalize(current_feature, dim=-1)  # Shape: [B, T, F]
+
+    # Compute cosine similarity
+    # Reshape for broadcasting: [B, F] x [N-T+1, T, F] -> [B, N-T+1]
+    similarities = torch.einsum("bf,ntf->bn", current_feature, MB_windows)  # Dot product along T and F
+
+    # Find the most similar sequence in MB for each batch
+    best_start_indices = similarities.argmax(dim=1)  # Shape: [B]
+
+    # Extract L consecutive frames starting from the best start indices
+    long_range_features = torch.stack([
+        MB[start_idx:start_idx + L] for start_idx in best_start_indices
+    ])  # Shape: [B, L, F]
+
+    if inputs.device != long_range_features.device:
+        long_range_features = long_range_features.to(inputs.device)
+    return long_range_features
+
+
 def get_long_range_feature_clip(inputs: torch.Tensor, metadata: dict[str, torch.Tensor], MB: torch.Tensor, L: int = 30):
     """
     Generate the long-range feature clip using precomputed features in MB.
@@ -185,6 +227,12 @@ def __test_long_features__():
         }
         for i in range(B)
     ]
+
+    from models.temporal_model import TemporalResNetLSTM
+
+    model = MemBankResNetLSTM(sequence_length=10)
+    model = TemporalResNetLSTM(backbone=model, sequence_length=10)
+    tt = get_long_range_feature_clip_online(model, inputs, MB)
 
     long_range_features = get_long_range_feature_clip(inputs, metadata, MB, L=L)
     print(long_range_features.shape)  # Expected: [40, 30, 512]
