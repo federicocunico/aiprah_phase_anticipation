@@ -19,7 +19,7 @@ def create_memorybank(
     if os.path.exists(mb_path):
         print("Loading memory bank...")
         with open(mb_path, "rb") as f:
-            memory_bank = torch.load(f)
+            memory_bank = torch.load(f, weights_only=False)
             train_mb = memory_bank["train"]
             val_mb = memory_bank["val"]
         print("Memory bank loaded!")
@@ -123,14 +123,21 @@ def get_long_range_feature_clip(inputs: torch.Tensor, metadata: dict[str, torch.
     long_range_features = torch.zeros(B, L, feature_dim, device=inputs.device)
 
     # Populate the long-range features using frames_indexes from metadata
-    for i, meta in enumerate(metadata):
-        frame_indexes = meta["fames_indexes"]  # List of frame indexes associated with MB
-        start_idx = max(0, len(frame_indexes) - L)  # Consider only the last L indexes
+    for i in range(B):
+        frame_indexes = metadata["frames_indexes"][i, :]  # List of frame indexes associated with MB
 
-        # Fill the memory bank for the current batch item
-        for j, idx in enumerate(frame_indexes[start_idx:]):
-            if idx < MB.size(0):  # Ensure index is within bounds of MB
-                long_range_features[i, j] = MB[idx]
+        # Select the last L frame indexes for long-range features
+        start_idx = frame_indexes[0] - L
+        if start_idx < 0:
+            offset = abs(start_idx)
+            start_idx = 0
+        else:
+            offset = 0
+
+        idxs = list(range(start_idx, frame_indexes[0] + offset))
+        assert len(idxs) == L, f"Expected {L} indexes, but got {len(idxs)}"
+        mb_feats = MB[idxs, :, :].squeeze()  # Extract the features from the memory bank
+        long_range_features[i, :, :] = mb_feats
 
     return long_range_features  # Shape: [B, L, 512]
 
@@ -164,23 +171,24 @@ def __test_long_features__():
     B, T, C, H, W = 40, 10, 3, 224, 224
     N = 1000  # Total number of features in memory bank
     L = 30  # Temporal length of the long-range feature clip
-    
+
     inputs = torch.randn(B, T, C, H, W)  # Random input for testing
     MB = torch.randn(N, 512)  # Precomputed memory bank features
-    
+
     metadata = [
         {
             "video_name": f"video_{i}",
             "frames_filepath": [f"frame_{j}.jpg" for j in range(T)],
-            "fames_indexes": list(range(i * T, i * T + T)),  # Map to MB indexes
+            "frames_indexes": list(range(i * T, i * T + T)),  # Map to MB indexes
             "phase_label": "some_label",
             "phase_label_dense": ["phase_label"] * T,
         }
         for i in range(B)
     ]
-    
+
     long_range_features = get_long_range_feature_clip(inputs, metadata, MB, L=L)
     print(long_range_features.shape)  # Expected: [40, 30, 512]
+
 
 if __name__ == "__main__":
     # __test_mb_creation__()

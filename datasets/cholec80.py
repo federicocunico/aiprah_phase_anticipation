@@ -148,7 +148,6 @@ class Cholec80Dataset(Dataset):
             ]
         )
 
-        assert self.mode in ["train", "val", "test"]
         if self.mode == "train":
             # videos from 1 to 32
             video_idxs = list(range(1, 33))
@@ -165,7 +164,8 @@ class Cholec80Dataset(Dataset):
             self.transform = self.test_transform
 
         else:
-            raise ValueError("Invalid mode")
+            video_idxs = list(range(1, 81))
+            self.transform = self.test_transform
 
         self.video_paths = [f"{self.root_dir}/videos/video{idx:02d}.mp4" for idx in video_idxs]
         self.label_paths = [f"{self.root_dir}/phase_annotations/video{idx:02d}-phase.txt" for idx in video_idxs]
@@ -174,6 +174,16 @@ class Cholec80Dataset(Dataset):
 
         self.video_paths_frames = {}
         self.video_annotations = {}
+
+        # Pre-load annotations
+        for i in range(num_videos):
+            video_name = self.video_paths[i].split(os.sep)[-1].replace(".mp4", "")
+            annotation_path = self.label_paths[i]
+            anns = load_annotation(annotation_path, self.target_fps)
+            self.video_annotations[video_name] = anns
+
+        # Transition matrix initialization
+        self.transition_matrix = self._compute_transition_matrix()
 
         for i in tqdm(range(num_videos), desc="Loading videos"):
             video_path = self.video_paths[i]
@@ -204,7 +214,7 @@ class Cholec80Dataset(Dataset):
                 frame_names.sort()
 
             self.video_paths_frames[video_name] = frame_names
-            anns = load_annotation(annotation_path, self.target_fps)
+            anns = self.video_annotations[video_name]
             if len(anns) != len(frame_names):
                 assert len(anns) > len(frame_names), f"Number of annotations is less than number of frames"
                 anns = anns[: len(frame_names)]
@@ -219,29 +229,60 @@ class Cholec80Dataset(Dataset):
                 all_frame_labels = self.video_annotations[video_name][i : i + self.seq_len]
 
                 # future_window = frame_names[i + self.seq_len : i + self.seq_len*2]
-                if i + self.seq_len*2 >= len(frame_names):
+                if i + self.seq_len * 2 >= len(frame_names):
                     all_future_labels = all_frame_labels  # final phase is the same as the last frame
                 else:
-                    all_future_labels = self.video_annotations[video_name][i + self.seq_len : i + self.seq_len*2]
+                    all_future_labels = self.video_annotations[video_name][i + self.seq_len : i + self.seq_len * 2]
 
                 _, future_label = all_future_labels[-1]
+                future_transition_probs = self.transition_matrix[future_label]
                 _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
-                frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window],
+                frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
                 windows.append(
                     {
                         "video_name": video_name,
                         "frames_filepath": frame_window,
-                        "fames_indexes": frame_indexes,
-                        "phase_label": frame_label,
-                        "phase_label_dense": [f[1] for f in all_frame_labels],
-                        "future_phase": future_label,
-                        "future_phase_dense": [f[1] for f in all_future_labels]
+                        "frames_indexes": torch.tensor(frame_indexes),
+                        "phase_label": torch.tensor(frame_label),
+                        "phase_label_dense": torch.tensor([f[1] for f in all_frame_labels]),
+                        "future_phase": torch.tensor(future_label),
+                        "future_phase_dense": torch.tensor([f[1] for f in all_future_labels]),
+                        "future_transition_probs": torch.tensor(future_transition_probs),
                     }
                 )
             self.windows.extend(windows)
 
         # random sort; no, let the DataLoader shuffle
         # np.random.shuffle(self.windows)
+
+    def _compute_transition_matrix(self):
+        """
+        Compute the phase transition probability matrix.
+
+        Returns:
+            torch.Tensor: A transition matrix of shape [num_classes, num_classes].
+        """
+        num_classes = 7  # Number of phases
+        transition_counts = torch.zeros((num_classes, num_classes))
+
+        # Count transitions across all annotations
+        for annotations in self.video_annotations.values():
+            for i in range(1, len(annotations)):
+                prev_phase = annotations[i - 1][1]
+                next_phase = annotations[i][1]
+                transition_counts[prev_phase, next_phase] += 1
+
+        # Normalize to create probabilities
+        transition_probs = transition_counts / transition_counts.sum(dim=1, keepdim=True)
+
+        # from matplotlib import pyplot as plt
+        # fig, ax = plt.subplots()
+        # ax.matshow(transition_probs)
+        # for (i, j), z in np.ndenumerate(transition_probs):
+        #     ax.text(j, i, '{:0.2f}'.format(z), ha='center', va='center')
+        # plt.savefig("transition_probs.png")
+
+        return transition_probs
 
     def __len__(self):
         return len(self.windows)
@@ -254,7 +295,7 @@ class Cholec80Dataset(Dataset):
 
 def __test__():
     data_dir = "./data/cholec80"
-    dataset = Cholec80Dataset(data_dir, mode="val", seq_len=10, fps=1)
+    dataset = Cholec80Dataset(data_dir, mode="all", seq_len=10, fps=1)
 
     print(f"Number of videos: {len(dataset)}")
     print(dataset[0])

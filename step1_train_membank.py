@@ -91,6 +91,9 @@ def train_membank():
         if acc > best_acc:
             print("Saving best model")
             best_acc = acc
+            with open(chkpt_dst.replace(".pth", ".txt"), "w") as f:
+                f.write(f"Epoch: {e}\n")
+                f.write(f"Validation Accuracy: {acc:.2f}\n")
             torch.save(model.state_dict(), chkpt_dst)
 
     model.eval()

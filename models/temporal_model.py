@@ -64,6 +64,22 @@ class TemporalResNetLSTM(nn.Module):
 
         return current_phase, anticipated_phase
 
+    @staticmethod
+    def compute_kl_divergence(predicted_logits, target_probs):
+        """
+        Compute KL Divergence loss for phase anticipation.
+
+        Args:
+            predicted_logits (torch.Tensor): Predicted logits from the model (before softmax).
+            target_probs (torch.Tensor): Ground truth probabilities for anticipation.
+
+        Returns:
+            torch.Tensor: KL divergence loss.
+        """
+        predicted_probs = F.log_softmax(predicted_logits, dim=-1)  # Convert logits to log-probabilities
+        kl_loss = F.kl_div(predicted_probs, target_probs, reduction="batchmean")
+        return kl_loss
+
 
 # class TemporalResNetLSTM(torch.nn.Module):
 #     def __init__(self, backbone: MemBankResNetLSTM, sequence_length: int, num_classes: int = 7):
@@ -104,15 +120,17 @@ class TemporalResNetLSTM(nn.Module):
 
 def __test__():
     from memory_bank_utils import get_long_range_feature_clip
+
     xin = torch.randn(4, 10, 3, 224, 224)
     mb = torch.randn(100, 512)
     model = MemBankResNetLSTM(10)
     model = TemporalResNetLSTM(model, 10)
 
-    lrf = get_long_range_feature_clip(xin, [{"fames_indexes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}], mb)
+    lrf = get_long_range_feature_clip(xin, [{"frames_indexes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}], mb)
     ph, ph_ant = model(xin, lrf)
 
     print(ph.shape, ph_ant.shape)
+
 
 if __name__ == "__main__":
     __test__()
