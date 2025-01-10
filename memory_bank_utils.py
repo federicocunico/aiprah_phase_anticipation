@@ -104,7 +104,9 @@ def create_memorybank(
 #     return long_feature
 
 
-def get_long_range_feature_clip_online(model: torch.nn.Module, inputs: torch.Tensor, MB: torch.Tensor, L: int = 30):
+def get_long_range_feature_clip_online(
+    model: torch.nn.Module, inputs: torch.Tensor, MB: torch.Tensor, MB_norm: torch.Tensor | None = None, L: int = 30
+):
     ## MB is just the memory bank features. But in testing we are running online mode.
     # To compensate this, we want to find which is the sequence of T consecutive frames
     # in MB that is the most similar to the current sequence of T frames in inputs.
@@ -116,16 +118,19 @@ def get_long_range_feature_clip_online(model: torch.nn.Module, inputs: torch.Ten
         raise ValueError("Model does not have get_features method.")
 
     # Extract features from the current sequence of inputs
-    current_feature: torch.Tensor = model.get_features(inputs)
-    current_feature = current_feature # .detach().cpu()  # Shape: [B, nfeats]
-    MB = MB.squeeze()  # Shape: [N, nfeats]
+    with torch.no_grad():
+        current_feature: torch.Tensor = model.get_features(inputs)
+    current_feature = current_feature  # .detach().cpu()  # Shape: [B, nfeats]
 
-    # Generate all possible T-length sequences in MB
-    B, T, C, H, W = inputs.size()
-    MB_windows = MB.unfold(0, T, 1).permute(0, 2, 1)  # Shape: [N-T+1, T, F]
-
-    # Normalize MB_windows and current_feature for cosine similarity
-    MB_windows = F.normalize(MB_windows, dim=-1)  # Normalize along feature dimension
+    if MB_norm is None:
+        MB = MB.squeeze()  # Shape: [N, nfeats]
+        # Generate all possible T-length sequences in MB
+        B, T, C, H, W = inputs.size()
+        MB_windows = MB.unfold(0, T, 1).permute(0, 2, 1)  # Shape: [N-T+1, T, F]
+        # Normalize MB_windows and current_feature for cosine similarity
+        MB_windows = F.normalize(MB_windows, dim=-1)  # Normalize along feature dimension
+    else:
+        MB_windows = MB_norm
     current_feature = F.normalize(current_feature, dim=-1)  # Shape: [B, T, F]
 
     # Compute cosine similarity
@@ -136,9 +141,9 @@ def get_long_range_feature_clip_online(model: torch.nn.Module, inputs: torch.Ten
     best_start_indices = similarities.argmax(dim=1)  # Shape: [B]
 
     # Extract L consecutive frames starting from the best start indices
-    long_range_features = torch.stack([
-        MB[start_idx:start_idx + L] for start_idx in best_start_indices
-    ])  # Shape: [B, L, F]
+    long_range_features = torch.stack(
+        [MB[start_idx : start_idx + L] for start_idx in best_start_indices]
+    )  # Shape: [B, L, F]
 
     if inputs.device != long_range_features.device:
         long_range_features = long_range_features.to(inputs.device)

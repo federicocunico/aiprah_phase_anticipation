@@ -75,7 +75,7 @@ def train_model():
     # -------------------
     # Hyperparameters
     # -------------------
-    batch_size = 16
+    batch_size = 4  # 16
     seq_len = 10
     epochs = 25
     target_fps = 1
@@ -116,6 +116,12 @@ def train_model():
     )
     train_mb = torch.as_tensor(train_mb)
     val_mb = torch.as_tensor(val_mb)
+    mb = torch.cat([train_mb, val_mb], dim=0)
+
+    mb = mb.squeeze()  # Shape: [N, nfeats]
+    MB_windows = mb.unfold(0, seq_len, 1).permute(0, 2, 1)  # Shape: [N-T+1, T, F]
+    MB_windows = torch.nn.functional.normalize(MB_windows, dim=-1)  # Normalize along feature dimension
+    mb_norm = MB_windows.to(device)
 
     # -------------------
     # Train
@@ -135,7 +141,8 @@ def train_model():
             labels = metadata["phase_label"].to(device)
             future_transition_probs = metadata["future_transition_probs"].to(device)  # Get transition probabilities
 
-            long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=train_mb)
+            # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=train_mb)
+            long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)
 
             current_phase, anticipated_phase = model(frames, long_range_features)
 
@@ -159,7 +166,8 @@ def train_model():
                 labels = metadata["phase_label"].to(device)
                 future_transition_probs = metadata["future_transition_probs"].to(device)
 
-                long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=val_mb)
+                # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=val_mb)
+                long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)
 
                 current_phase, anticipated_phase = model(frames, long_range_features)
 
@@ -189,21 +197,23 @@ def train_model():
 
     run.finish()
 
+    return chkpt_dst
+
 
 if __name__ == "__main__":
-    # train_model()
+    train_model()
 
-    batch_size = 16
-    seq_len = 10
-    target_fps = 1
-    num_classes = 7
-    test_dataset = Cholec80Dataset(root_dir="./data/cholec80", mode="test", seq_len=seq_len, fps=target_fps)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=30, pin_memory=True)
-    test(
-        backbone=None,
-        sequence_length=10,
-        num_classes=7,
-        chkpt_dst="./wandb/run-stage2/checkpoints/main_model_best.pth",
-        test_loader=test_loader,
-        device=torch.device("cuda:0"),
-    )
+    # batch_size = 16
+    # seq_len = 10
+    # target_fps = 1
+    # num_classes = 7
+    # test_dataset = Cholec80Dataset(root_dir="./data/cholec80", mode="test", seq_len=seq_len, fps=target_fps)
+    # test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=30, pin_memory=True)
+    # test(
+    #     backbone=None,
+    #     sequence_length=10,
+    #     num_classes=7,
+    #     chkpt_dst="./wandb/run-stage2/checkpoints/main_model_best.pth",
+    #     test_loader=test_loader,
+    #     device=torch.device("cuda:0"),
+    # )
