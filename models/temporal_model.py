@@ -21,7 +21,7 @@ class TemporalResNetLSTM(nn.Module):
         self.lstm = nn.LSTM(2048, 512, batch_first=True)
         self.fc_c = nn.Linear(512, num_classes)  # Phase classification
         self.fc_h_c = nn.Linear(1024, 512)  # Hidden state combination
-        self.fc_anticipation = nn.Linear(512, num_classes)  # Phase anticipation
+        self.fc_anticipation = nn.Linear(512, 1)  # Phase anticipation
         self.nl_block = NLBlock()
         self.dropout = nn.Dropout(p=0.5)
         self.time_conv = TimeConv()
@@ -48,7 +48,7 @@ class TemporalResNetLSTM(nn.Module):
         return y
 
     def forward(self, x: torch.Tensor, mb_features: torch.Tensor):
-        y = self.get_features(x)
+        y: torch.Tensor = self.get_features(x)
 
         # Long-range features via time convolution
         Lt = self.time_conv(mb_features)
@@ -69,21 +69,19 @@ class TemporalResNetLSTM(nn.Module):
 
         return current_phase, anticipated_phase
 
-    @staticmethod
-    def compute_kl_divergence(predicted_logits, target_probs):
-        """
-        Compute KL Divergence loss for phase anticipation.
-
-        Args:
-            predicted_logits (torch.Tensor): Predicted logits from the model (before softmax).
-            target_probs (torch.Tensor): Ground truth probabilities for anticipation.
-
-        Returns:
-            torch.Tensor: KL divergence loss.
-        """
-        predicted_probs = F.log_softmax(predicted_logits, dim=-1)  # Convert logits to log-probabilities
-        kl_loss = F.kl_div(predicted_probs, target_probs, reduction="batchmean")
-        return kl_loss
+    # @staticmethod
+    # def compute_kl_divergence(predicted_logits, target_probs):
+    #     """
+    #     Compute KL Divergence loss for phase anticipation.
+    #     Args:
+    #         predicted_logits (torch.Tensor): Predicted logits from the model (before softmax).
+    #         target_probs (torch.Tensor): Ground truth probabilities for anticipation.
+    #     Returns:
+    #         torch.Tensor: KL divergence loss.
+    #     """
+    #     predicted_probs = F.log_softmax(predicted_logits, dim=-1)  # Convert logits to log-probabilities
+    #     kl_loss = F.kl_div(predicted_probs, target_probs, reduction="batchmean")
+    #     return kl_loss
 
 
 # class TemporalResNetLSTM(torch.nn.Module):

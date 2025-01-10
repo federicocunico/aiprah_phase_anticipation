@@ -43,7 +43,7 @@ def test(sequence_length, num_classes, chkpt_dst, test_loader, device, backbone=
             frames, metadata = batch
             frames = frames.to(device)
             labels = metadata["phase_label"].to(device)
-            future_transition_probs = metadata["future_transition_probs"].to(device)
+            # time_to_next_phase = metadata["time_to_next_phase"].to(device)
 
             long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb)
 
@@ -129,6 +129,7 @@ def train_model():
 
     optimizer = Adam(model.parameters(), lr=1e-4)
     criterion_phase = nn.CrossEntropyLoss()
+    criterion_anticipation = nn.MSELoss()
 
     l = len(train_loader)
 
@@ -139,7 +140,7 @@ def train_model():
             frames, metadata = batch
             frames = frames.to(device)
             labels = metadata["phase_label"].to(device)
-            future_transition_probs = metadata["future_transition_probs"].to(device)  # Get transition probabilities
+            time_to_next_phase = metadata["time_to_next_phase"].to(device)  # Get transition probabilities
 
             # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=train_mb)
             long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)
@@ -147,7 +148,8 @@ def train_model():
             current_phase, anticipated_phase = model(frames, long_range_features)
 
             loss_phase: torch.Tensor = criterion_phase(current_phase, labels)
-            loss_anticipation = model.compute_kl_divergence(anticipated_phase, future_transition_probs)
+            # loss_anticipation = model.compute_kl_divergence(anticipated_phase, future_transition_probs)
+            loss_anticipation = criterion_anticipation(anticipated_phase, time_to_next_phase)
 
             loss = loss_phase + loss_anticipation
 
@@ -164,7 +166,7 @@ def train_model():
                 frames, metadata = batch
                 frames = frames.to(device)
                 labels = metadata["phase_label"].to(device)
-                future_transition_probs = metadata["future_transition_probs"].to(device)
+                # time_to_next_phase = metadata["time_to_next_phase"].to(device)
 
                 # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=val_mb)
                 long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)

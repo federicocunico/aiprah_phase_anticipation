@@ -148,19 +148,33 @@ class Cholec80Dataset(Dataset):
             ]
         )
 
+        # if self.mode == "train":
+        #     # videos from 1 to 32
+        #     video_idxs = list(range(1, 33))
+        #     self.transform = self.train_transform
+
+        # elif self.mode == "test":
+        #     # videos from 41 to 80
+        #     video_idxs = list(range(41, 81))
+        #     self.transform = self.test_transform
+
+        # elif self.mode == "val":
+        #     # videos from 32 to 40
+        #     video_idxs = list(range(32, 41))
+        #     self.transform = self.test_transform
         if self.mode == "train":
-            # videos from 1 to 32
-            video_idxs = list(range(1, 33))
+            # videos from 1 to 45
+            video_idxs = list(range(1, 46))
             self.transform = self.train_transform
 
         elif self.mode == "test":
-            # videos from 41 to 80
-            video_idxs = list(range(41, 81))
+            # videos from 60 to 80
+            video_idxs = list(range(61, 81))
             self.transform = self.test_transform
 
         elif self.mode == "val":
-            # videos from 32 to 40
-            video_idxs = list(range(32, 41))
+            # videos from 45 to 60
+            video_idxs = list(range(46, 61))
             self.transform = self.test_transform
 
         else:
@@ -183,7 +197,8 @@ class Cholec80Dataset(Dataset):
             self.video_annotations[video_name] = anns
 
         # Transition matrix initialization
-        self.transition_matrix = self._compute_transition_matrix()
+        # self.transition_matrix = self._compute_transition_matrix()
+        self.phase_transition_time = self._compute_phase_transition_time()
 
         for i in tqdm(range(num_videos), desc="Loading videos"):
             video_path = self.video_paths[i]
@@ -235,9 +250,10 @@ class Cholec80Dataset(Dataset):
                     all_future_labels = self.video_annotations[video_name][i + self.seq_len : i + self.seq_len * 2]
 
                 _, future_label = all_future_labels[-1]
-                future_transition_probs = self.transition_matrix[future_label]
                 _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
                 frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
+                all_ph_trans_time = self.phase_transition_time[video_name]
+                ph_trans_time = [all_ph_trans_time[t] for t in frame_indexes]
                 windows.append(
                     {
                         "video_name": video_name,
@@ -247,7 +263,7 @@ class Cholec80Dataset(Dataset):
                         "phase_label_dense": torch.tensor([f[1] for f in all_frame_labels]),
                         "future_phase": torch.tensor(future_label),
                         "future_phase_dense": torch.tensor([f[1] for f in all_future_labels]),
-                        "future_transition_probs": torch.tensor(future_transition_probs),
+                        "time_to_next_phase": torch.tensor(ph_trans_time),
                     }
                 )
             self.windows.extend(windows)
@@ -256,6 +272,7 @@ class Cholec80Dataset(Dataset):
         # np.random.shuffle(self.windows)
 
     def _compute_transition_matrix(self):
+        raise RuntimeError("This function is not used anymore")
         """
         Compute the phase transition probability matrix.
 
@@ -283,6 +300,45 @@ class Cholec80Dataset(Dataset):
         # plt.savefig("transition_probs.png")
 
         return transition_probs
+
+    def _compute_phase_transition_time(self) -> dict[str, dict[int, float]]:
+        """
+        For a given index i, compute the remaining time to transition to the next phase.
+        Time is given by the number of frames until the next phase transition, multiplied by the target_fps.
+        Hence, the result is in seconds. Finally, is converted in minutes, for better readability.
+        """
+        time_to_next_phase: dict[str, list[float]] = {}  # {video_name: {frame_index: time_to_next_phase}}
+        # creating signals for each video
+        for video_name, annotations in self.video_annotations.items():
+            phases = [phase for _, phase in annotations]
+            # compute the number of frames until the next phase transition.
+            # The phase transition is considered when the phase changes.
+            curr_p = phases[0]
+            indexes_of_change = []
+            for i in range(1, len(phases)):
+                if phases[i] != curr_p:
+                    curr_p = phases[i]
+                    indexes_of_change.append(i)
+            indexes_of_change.append(i + 1)
+
+            # calculate the time to the next phase transition:
+            initial = 0
+            tmp = [0] * len(phases)
+            for i in indexes_of_change:
+                n_elements = i - initial
+                tmp[initial:i] = list(range(n_elements - 1, -1, -1))
+                initial = i
+
+            timings = np.asarray(tmp)
+            # now timings are one every 25 second (because self.target_fps is 1)
+            # we need to convert it to the seconds
+            timings = timings * self.target_fps  # now timings are in seconds
+            timings = timings / 60  # now timings are in minutes
+            timings = timings.tolist()
+
+            time_to_next_phase[video_name] = timings  # {i: val for (i, val) in enumerate(timings)}
+
+        return time_to_next_phase
 
     def __len__(self):
         return len(self.windows)
