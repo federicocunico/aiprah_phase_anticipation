@@ -253,7 +253,8 @@ class Cholec80Dataset(Dataset):
                 _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
                 frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
                 all_ph_trans_time = self.phase_transition_time[video_name]
-                ph_trans_time = [all_ph_trans_time[t] for t in frame_indexes]
+                ph_trans_time_dense = [all_ph_trans_time[t] for t in frame_indexes]
+                ph_trans_time = ph_trans_time_dense[-1]
                 windows.append(
                     {
                         "video_name": video_name,
@@ -263,6 +264,7 @@ class Cholec80Dataset(Dataset):
                         "phase_label_dense": torch.tensor([f[1] for f in all_frame_labels]),
                         "future_phase": torch.tensor(future_label),
                         "future_phase_dense": torch.tensor([f[1] for f in all_future_labels]),
+                        "time_to_next_phase_dense": torch.tensor(ph_trans_time_dense),
                         "time_to_next_phase": torch.tensor(ph_trans_time),
                     }
                 )
