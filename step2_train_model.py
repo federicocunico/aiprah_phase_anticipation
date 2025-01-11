@@ -92,7 +92,7 @@ def train_model():
     epochs = 25
     target_fps = 1
     num_classes = 7
-    adaptive_weighting = False
+    adaptive_weighting = True
     mb_pretrained_model = "./wandb/run-stage1/checkpoints/membank_best.pth"
     chkpt_dst = os.path.join(run.dir, "..", "checkpoints", "main_model_best.pth")
 
