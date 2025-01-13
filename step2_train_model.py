@@ -48,6 +48,7 @@ def test(sequence_length, num_classes, chkpt_dst, test_loader, device, backbone=
             frames = frames.to(device)
             labels = metadata["phase_label"].to(device)
             time_to_next_phase = metadata["time_to_next_phase"]  # .to(device)
+            time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
             long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb)
 
@@ -92,7 +93,9 @@ def train_model():
     epochs = 25
     target_fps = 1
     num_classes = 7
-    adaptive_weighting = True
+    multitask_strategy = "lambda" # "adaptive_weighting" # "none"
+    l1 = 1
+    l2 = 0.3
     mb_pretrained_model = "./wandb/run-stage1/checkpoints/membank_best.pth"
     chkpt_dst = os.path.join(run.dir, "..", "checkpoints", "main_model_best.pth")
 
@@ -155,18 +158,21 @@ def train_model():
             frames = frames.to(device)
             labels = metadata["phase_label"].to(device)
             time_to_next_phase = metadata["time_to_next_phase"].to(device)  # Get transition probabilities
+            time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
             # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=train_mb)
             long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)
 
             current_phase, anticipated_phase = model(frames, long_range_features)
             anticipated_phase = anticipated_phase.squeeze()  # [B, 1] -> [B]
+            # scale anticipated phase, cut if it is greater than model.max_anticipation (default=5 mintues)
+            time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
             loss_phase: torch.Tensor = criterion_phase(current_phase, labels)
             # loss_anticipation = model.compute_kl_divergence(anticipated_phase, future_transition_probs)
             loss_anticipation: torch.Tensor = criterion_anticipation(anticipated_phase.reshape(-1), time_to_next_phase)
 
-            if adaptive_weighting:
+            if multitask_strategy == "adaptive_weighting":
                 # Compute dynamic weights based on current loss magnitudes
                 weight_phase = 1.0 / (loss_phase.item() + 1e-8)  # Add a small constant to prevent division by zero
                 weight_anticipation = 1.0 / (loss_anticipation.item() + 1e-8)
@@ -178,12 +184,23 @@ def train_model():
 
                 # Compute weighted loss
                 loss = weight_phase * loss_phase + weight_anticipation * loss_anticipation
-            else:
+            elif multitask_strategy == "lambda":
+                loss = l1 * loss_phase + l2 * loss_anticipation
+            elif multitask_strategy == "none" or multitask_strategy is None:  # none
                 loss = loss_phase + loss_anticipation
+            else:
+                raise ValueError(f"Invalid multitask strategy: {multitask_strategy}")
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            if i % 1000 == 0 and i > 0:
+                wandb.log({"phase_loss": loss_phase.item(), "anticipation_loss": loss_anticipation.item()})
+                # print(f"Epoch {e}, Batch {i}/{l}; Phase Loss: {loss_phase.item():.2f} Anticipation Loss: {loss_anticipation.item():.2f}")
+            # print every 30% of the epoch
+            # if i % (l // 3) == 0 and i > 0:
+            #     print(f"Epoch {e}, Batch {i}/{l}; Phase Loss: {loss_phase.item():.2f} Anticipation Loss: {loss_anticipation.item():.2f}")
 
         # validation
         model.eval()
@@ -197,6 +214,7 @@ def train_model():
                 frames = frames.to(device)
                 labels = metadata["phase_label"].to(device)
                 time_to_next_phase = metadata["time_to_next_phase"]  # .to(device)
+                time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
                 # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=val_mb)
                 long_range_features = get_long_range_feature_clip_online(

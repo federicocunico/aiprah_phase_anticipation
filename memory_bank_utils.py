@@ -141,8 +141,11 @@ def get_long_range_feature_clip_online(
     best_start_indices = similarities.argmax(dim=1)  # Shape: [B]
 
     # Extract L consecutive frames starting from the best start indices
-    if start_idx + L > MB.size(0):
-        start_idx = MB.size(0) - L
+    for i, start_idx in enumerate(best_start_indices):
+        if start_idx + L > MB.size(0):
+            start_idx = MB.size(0) - L
+            best_start_indices[i] = start_idx
+
     long_range_features = torch.stack(
         [MB[start_idx : start_idx + L] for start_idx in best_start_indices]
     )  # Shape: [B, L, F]

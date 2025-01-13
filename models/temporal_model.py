@@ -13,7 +13,8 @@ from torch.nn import init
 
 
 class TemporalResNetLSTM(nn.Module):
-    def __init__(self, backbone: MemBankResNetLSTM, sequence_length: int, num_classes: int = 7):
+    def __init__(self, backbone: MemBankResNetLSTM, 
+                 sequence_length: int, num_classes: int = 7, max_anticipation: int = 5):
         super(TemporalResNetLSTM, self).__init__()
 
         self.sequence_length = sequence_length
@@ -25,6 +26,7 @@ class TemporalResNetLSTM(nn.Module):
         self.nl_block = NLBlock()
         self.dropout = nn.Dropout(p=0.5)
         self.time_conv = TimeConv()
+        self.max_anticipation = max_anticipation  # minutes
 
         # Weight initialization
         init.xavier_normal_(self.lstm.all_weights[0][0])
@@ -66,6 +68,7 @@ class TemporalResNetLSTM(nn.Module):
 
         # Phase anticipation
         anticipated_phase = self.fc_anticipation(y_combined)
+        anticipated_phase = self.max_anticipation * F.sigmoid(anticipated_phase)
 
         return current_phase, anticipated_phase
 
