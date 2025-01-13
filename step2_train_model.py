@@ -9,6 +9,7 @@ from tqdm import tqdm
 import wandb
 from datasets.cholec80 import Cholec80Dataset
 from models.membank_model import MemBankResNetLSTM
+from models.memory_bank import MemoryBank
 from models.temporal_model import TemporalResNetLSTM
 from memory_bank_utils import create_memorybank, get_long_range_feature_clip, get_long_range_feature_clip_online
 
@@ -28,10 +29,8 @@ def test(sequence_length, num_classes, chkpt_dst, test_loader, device, backbone=
     val_set = Cholec80Dataset(root_dir="./data/cholec80", mode="val", seq_len=sequence_length, fps=1)
     train_loader = DataLoader(train_set, batch_size=16, shuffle=False, num_workers=30, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=16, shuffle=False, num_workers=30, pin_memory=True)
-    train_mb, val_mb = create_memorybank(
-        model=backbone, train_loader=train_loader, val_loader=val_loader, device=device
-    )
-    mb = torch.cat([torch.as_tensor(train_mb), torch.as_tensor(val_mb)], dim=0)
+    mb = create_memorybank(model=backbone, train_loader=train_loader, val_loader=val_loader, device=device)
+    # mb = torch.cat([torch.as_tensor(train_mb), torch.as_tensor(val_mb)], dim=0)
     mb = mb.to(device)
 
     mse = nn.MSELoss()
@@ -50,9 +49,9 @@ def test(sequence_length, num_classes, chkpt_dst, test_loader, device, backbone=
             time_to_next_phase = metadata["time_to_next_phase"]  # .to(device)
             time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
-            long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb)
+            # long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb)
 
-            current_phase, anticipated_phase = model(frames, long_range_features)
+            current_phase, anticipated_phase = model(frames)
             anticipated_phase = anticipated_phase.squeeze()  # [B, 1] -> [B]
 
             _, predicted = torch.max(current_phase, 1)
@@ -93,7 +92,7 @@ def train_model():
     epochs = 25
     target_fps = 1
     num_classes = 7
-    multitask_strategy = "lambda" # "adaptive_weighting" # "none"
+    multitask_strategy = "lambda"  # "adaptive_weighting" # "none"
     l1 = 1
     l2 = 0.3
     mb_pretrained_model = "./wandb/run-stage1/checkpoints/membank_best.pth"
@@ -124,20 +123,16 @@ def train_model():
     assert os.path.isfile(mb_pretrained_model), "Pretrained model not found"
     backbone.load_state_dict(torch.load(mb_pretrained_model))
 
-    model = TemporalResNetLSTM(backbone=backbone, sequence_length=seq_len, num_classes=num_classes)
-    model.to(device)
-
-    train_mb, val_mb = create_memorybank(
-        model=backbone, train_loader=train_loader, val_loader=val_loader, device=device
+    mb: MemoryBank = create_memorybank(
+        model=backbone,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        membank_size=len(train_dataset),
     )
-    train_mb = torch.as_tensor(train_mb)
-    val_mb = torch.as_tensor(val_mb)
-    mb = torch.cat([train_mb, val_mb], dim=0)
 
-    mb = mb.squeeze()  # Shape: [N, nfeats]
-    MB_windows = mb.unfold(0, seq_len, 1).permute(0, 2, 1)  # Shape: [N-T+1, T, F]
-    MB_windows = torch.nn.functional.normalize(MB_windows, dim=-1)  # Normalize along feature dimension
-    mb_norm = MB_windows.to(device)
+    model = TemporalResNetLSTM(backbone=backbone, memory_bank=mb, sequence_length=seq_len, num_classes=num_classes)
+    model.to(device)
 
     # -------------------
     # Train
@@ -161,9 +156,9 @@ def train_model():
             time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
             # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=train_mb)
-            long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)
+            # long_range_features = get_long_range_feature_clip_online(model=model, inputs=frames, MB=mb, MB_norm=mb_norm)
 
-            current_phase, anticipated_phase = model(frames, long_range_features)
+            current_phase, anticipated_phase = model(frames)
             anticipated_phase = anticipated_phase.squeeze()  # [B, 1] -> [B]
             # scale anticipated phase, cut if it is greater than model.max_anticipation (default=5 mintues)
             time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
@@ -217,11 +212,11 @@ def train_model():
                 time_to_next_phase = torch.clamp(time_to_next_phase, 0, model.max_anticipation)
 
                 # long_range_features = get_long_range_feature_clip(inputs=frames, metadata=metadata, MB=val_mb)
-                long_range_features = get_long_range_feature_clip_online(
-                    model=model, inputs=frames, MB=mb, MB_norm=mb_norm
-                )
+                # long_range_features = get_long_range_feature_clip_online(
+                #     model=model, inputs=frames, MB=mb, MB_norm=mb_norm
+                # )
 
-                current_phase, anticipated_phase = model(frames, long_range_features)
+                current_phase, anticipated_phase = model(frames)
                 anticipated_phase = anticipated_phase.squeeze()  # [B, 1] -> [B]
 
                 _, predicted = torch.max(current_phase, 1)

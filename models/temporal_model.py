@@ -3,6 +3,7 @@ from torch.nn import init
 from torch import nn
 import torch.nn.functional as F
 from models.membank_model import MemBankResNetLSTM
+from models.memory_bank import MemoryBank
 from models.non_local import NLBlock, TimeConv
 
 
@@ -13,12 +14,19 @@ from torch.nn import init
 
 
 class TemporalResNetLSTM(nn.Module):
-    def __init__(self, backbone: MemBankResNetLSTM, 
-                 sequence_length: int, num_classes: int = 7, max_anticipation: int = 5):
+    def __init__(
+        self,
+        backbone: MemBankResNetLSTM,
+        memory_bank: MemoryBank,
+        sequence_length: int,
+        num_classes: int = 7,
+        max_anticipation: int = 5,
+    ):
         super(TemporalResNetLSTM, self).__init__()
 
         self.sequence_length = sequence_length
         self.backbone: MemBankResNetLSTM = backbone.share  # Feature extractor
+        self.memory_bank: MemoryBank = memory_bank
         self.lstm = nn.LSTM(2048, 512, batch_first=True)
         self.fc_c = nn.Linear(512, num_classes)  # Phase classification
         self.fc_h_c = nn.Linear(1024, 512)  # Hidden state combination
@@ -49,8 +57,11 @@ class TemporalResNetLSTM(nn.Module):
 
         return y
 
-    def forward(self, x: torch.Tensor, mb_features: torch.Tensor):
+    def forward(self, x: torch.Tensor):
         y: torch.Tensor = self.get_features(x)
+
+        # query memory bank
+        mb_features, _ = self.memory_bank(y)
 
         # Long-range features via time convolution
         Lt = self.time_conv(mb_features)
@@ -127,15 +138,18 @@ class TemporalResNetLSTM(nn.Module):
 def __test__():
     from memory_bank_utils import get_long_range_feature_clip
 
-    xin = torch.randn(4, 10, 3, 224, 224)
-    mb = torch.randn(100, 512)
-    model = MemBankResNetLSTM(10)
-    model = TemporalResNetLSTM(model, 10)
+    xin = torch.randn(16, 10, 3, 224, 224)
+    backbone = MemBankResNetLSTM(10)
+    mb = MemoryBank(1000, 512)
 
-    lrf = get_long_range_feature_clip(xin, [{"frames_indexes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}], mb)
-    ph, ph_ant = model(xin, lrf)
+    model = TemporalResNetLSTM(backbone, mb, 10)
 
-    print(ph.shape, ph_ant.shape)
+    # lrf = get_long_range_feature_clip(xin, [{"frames_indexes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}], mb)
+    # ph, ph_ant = model(xin, lrf)
+
+    current_phase, anticipated_phase = model(xin)
+
+    print(current_phase.shape, anticipated_phase)
 
 
 if __name__ == "__main__":

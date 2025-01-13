@@ -6,3 +6,5 @@ data/*
 !data/.gitkeep
 
 wandb/
+
+bak_v1/
