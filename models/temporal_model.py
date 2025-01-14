@@ -20,67 +20,77 @@ class TemporalResNetLSTM(nn.Module):
         memory_bank: MemoryBank,
         sequence_length: int,
         num_classes: int = 7,
-        max_anticipation: int = 5,
+        time_horizon: int = 5,
     ):
         super(TemporalResNetLSTM, self).__init__()
 
         self.sequence_length = sequence_length
-        self.backbone: MemBankResNetLSTM = backbone.share  # Feature extractor
+        self.backbone: MemBankResNetLSTM = backbone  # Feature extractor
+        # Freeze the backbone
+        for param in self.backbone.parameters():
+            param.requires_grad = False
         self.memory_bank: MemoryBank = memory_bank
-        self.lstm = nn.LSTM(2048, 512, batch_first=True)
+        # self.lstm = nn.LSTM(2048, 512, batch_first=True)
+        self.fc_h_c = nn.Linear(1024*sequence_length, 512)  # Hidden state combination
+
         self.fc_c = nn.Linear(512, num_classes)  # Phase classification
-        self.fc_h_c = nn.Linear(1024, 512)  # Hidden state combination
         self.fc_anticipation = nn.Linear(512, 1)  # Phase anticipation
-        self.nl_block = NLBlock()
+        self.nl_block = NLBlock(feature_num=512, sequence_length=sequence_length)
         self.dropout = nn.Dropout(p=0.5)
         self.time_conv = TimeConv()
-        self.max_anticipation = max_anticipation  # minutes
+        self.time_horizon = time_horizon  # minutes
 
         # Weight initialization
-        init.xavier_normal_(self.lstm.all_weights[0][0])
-        init.xavier_normal_(self.lstm.all_weights[0][1])
+        # init.xavier_normal_(self.lstm.all_weights[0][0])
+        # init.xavier_normal_(self.lstm.all_weights[0][1])
         init.xavier_uniform_(self.fc_c.weight)
         init.xavier_uniform_(self.fc_h_c.weight)
         init.xavier_uniform_(self.fc_anticipation.weight)
 
-    def get_features(self, x: torch.Tensor):
-        # Extract features from the backbone
-        x = x.view(-1, 3, 224, 224)
-        x = self.backbone.forward(x)
-        x = x.view(-1, self.sequence_length, 2048)
+    # def get_features(self, x: torch.Tensor):
+    #     # Extract features from the backbone
+    #     x = x.view(-1, 3, 224, 224)
+    #     x = self.backbone.forward(x)
+    #     x = x.view(-1, self.sequence_length, 2048)
 
-        # Process with LSTM
-        self.lstm.flatten_parameters()
-        y, _ = self.lstm(x)
-        y = y.contiguous().view(-1, 512)
-        y = y[self.sequence_length - 1 :: self.sequence_length]  # Use the last hidden state for the sequence
+    #     # Process with LSTM
+    #     self.lstm.flatten_parameters()
+    #     y, _ = self.lstm(x)
+    #     y = y.contiguous().view(-1, 512)
+    #     y = y[self.sequence_length - 1 :: self.sequence_length]  # Use the last hidden state for the sequence
 
-        return y
+    #     return y
 
     def forward(self, x: torch.Tensor):
-        y: torch.Tensor = self.get_features(x)
+        y: torch.Tensor = self.backbone.get_features(x)  # [batch_size*T, 512]
+        # y = y.view(-1, self.sequence_length, 512)  # [batch_size, T, 512]
 
         # query memory bank
-        mb_features, _ = self.memory_bank(y)
+        mb_features, _ = self.memory_bank(y)  # [batch_size*T, 512]  # agisce su B*T
 
         # Long-range features via time convolution
-        Lt = self.time_conv(mb_features)
+        Lt = self.time_conv(mb_features)  # [batch_size*T, 512]  # agisce sulle features spaziali (512)
 
         # Non-local operation with the long-range features
-        y_1 = self.nl_block(y, Lt)
+        y_1 = self.nl_block(y, Lt)  # [batch_size*T, 512]  # agisce su B*T
 
         # Combine local and long-range features
-        y_combined = torch.cat([y, y_1], dim=1)
-        y_combined = self.dropout(self.fc_h_c(y_combined))
-        y_combined = F.relu(y_combined)
+        y = y.view(-1, self.sequence_length*512)  # [batch_size, T*512]
+        y_1 = y_1.view(-1, self.sequence_length*512)  # [batch_size, T*512]
+        y_combined = torch.cat([y, y_1], dim=-1)  # [B, T*1024]
+        y_combined = self.dropout(self.fc_h_c(y_combined))  # [B, T, 512]
+        y_combined = F.relu(y_combined)  # ReLU activation
 
         # Current phase prediction
-        current_phase = self.fc_c(y_combined)
+        current_phase = self.fc_c(y_combined)  # [batch_size, num_classes]
 
         # Phase anticipation
-        anticipated_phase = self.fc_anticipation(y_combined)
-        anticipated_phase = self.max_anticipation * F.sigmoid(anticipated_phase)
+        anticipated_phase = self.fc_anticipation(y_combined)  # [batch_size, 1]
+        anticipated_phase = self.time_horizon * F.sigmoid(anticipated_phase)    
+        anticipated_phase = anticipated_phase.squeeze(-1)
 
+
+        # assert current_phase.shape[0] == anticipated_phase.shape[0]
         return current_phase, anticipated_phase
 
     # @staticmethod
@@ -138,7 +148,7 @@ class TemporalResNetLSTM(nn.Module):
 def __test__():
     from memory_bank_utils import get_long_range_feature_clip
 
-    xin = torch.randn(16, 10, 3, 224, 224)
+    xin = torch.randn(4, 10, 3, 224, 224)
     backbone = MemBankResNetLSTM(10)
     mb = MemoryBank(1000, 512)
 
