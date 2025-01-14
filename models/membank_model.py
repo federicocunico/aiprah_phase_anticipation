@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 from torchvision import models
+from torchvision.models.resnet import ResNet50_Weights, ResNet
 
 class Identity(nn.Module):
     def forward(self, x):
@@ -13,9 +14,9 @@ class MemBankResNetLSTM(torch.nn.Module):
 
         self.sequence_length = sequence_length
 
-        resnet = models.resnet50(pretrained=True)
+        resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         resnet.fc = Identity()
-        self.share = resnet
+        self.share: ResNet = resnet
         self.lstm = nn.LSTM(2048, 512, batch_first=True)
         self.fc = nn.Linear(512, num_classes)
         self.dropout = nn.Dropout(p=0.2)
