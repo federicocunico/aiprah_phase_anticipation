@@ -19,13 +19,16 @@ class ModelLoss(torch.nn.Module):
         time_to_next_phase: torch.Tensor,
     ):
         loss_phase: torch.Tensor = self.criterion_phase(current_phase, labels)
-        loss_anticipation: torch.Tensor = self.criterion_anticipation(anticipated_phase.reshape(-1), time_to_next_phase)
+        loss_anticipation: torch.Tensor = self.criterion_anticipation(anticipated_phase, time_to_next_phase)
 
         if self.multitask_strategy == "lambda":
-            loss = self.l1 * loss_phase + self.l2 * loss_anticipation
+            loss_anticipation = self.l2 * loss_anticipation
+            loss_phase = self.l1 * loss_phase
         elif self.multitask_strategy == "none" or self.multitask_strategy is None:
-            loss = loss_phase + loss_anticipation
+            pass
         else:
             raise ValueError(f"Unknown multitask strategy: {self.multitask_strategy}")
+
+        loss = loss_phase + loss_anticipation
 
         return loss, loss_phase, loss_anticipation

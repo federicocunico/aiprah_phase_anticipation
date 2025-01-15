@@ -246,7 +246,7 @@ def __test_long_features__():
         for i in range(B)
     ]
 
-    from models.temporal_model import TemporalResNetLSTM
+    from models.temporal_model_v1 import TemporalResNetLSTM
 
     model = MemBankResNetLSTM(sequence_length=10)
     model = TemporalResNetLSTM(backbone=model, sequence_length=10)

@@ -1,7 +1,9 @@
 import glob
+from collections import defaultdict
 import os
 import shutil
 import cv2
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
@@ -177,6 +179,18 @@ class Cholec80Dataset(Dataset):
             video_idxs = list(range(46, 61))
             self.transform = self.test_transform
 
+        # -----------------------------------
+        elif self.mode == "demo_train":
+            video_idxs = list(range(1, 3))
+            self.transform = self.train_transform
+        elif self.mode == "demo_val":
+            video_idxs = list(range(3, 5))
+            self.transform = self.test_transform
+        elif self.mode == "demo_test":
+            video_idxs = list(range(5, 7))
+            self.transform = self.test_transform
+        # -----------------------------------
+
         else:
             video_idxs = list(range(1, 81))
             self.transform = self.test_transform
@@ -252,20 +266,20 @@ class Cholec80Dataset(Dataset):
                 _, future_label = all_future_labels[-1]
                 _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
                 frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
-                all_ph_trans_time = self.phase_transition_time[video_name]
-                ph_trans_time_dense = [all_ph_trans_time[t] for t in frame_indexes]
-                ph_trans_time = ph_trans_time_dense[-1]
+                all_ph_trans_time = torch.asarray(self.phase_transition_time[video_name])  # [NUM_CLASSES, NUM_FRAMES]
+                ph_trans_time_dense = all_ph_trans_time[:, frame_indexes]
+                ph_trans_time = ph_trans_time_dense[:, -1]
                 windows.append(
                     {
                         "video_name": video_name,
                         "frames_filepath": frame_window,
-                        "frames_indexes": torch.tensor(frame_indexes),
-                        "phase_label": torch.tensor(frame_label),
-                        "phase_label_dense": torch.tensor([f[1] for f in all_frame_labels]),
-                        "future_phase": torch.tensor(future_label),
-                        "future_phase_dense": torch.tensor([f[1] for f in all_future_labels]),
-                        "time_to_next_phase_dense": torch.tensor(ph_trans_time_dense),
-                        "time_to_next_phase": torch.tensor(ph_trans_time),
+                        "frames_indexes": torch.asarray(frame_indexes),
+                        "phase_label": torch.asarray(frame_label),
+                        "phase_label_dense": torch.asarray([f[1] for f in all_frame_labels]),
+                        "future_phase": torch.asarray(future_label),
+                        "future_phase_dense": torch.asarray([f[1] for f in all_future_labels]),
+                        "time_to_next_phase_dense": ph_trans_time_dense,
+                        "time_to_next_phase": ph_trans_time,
                     }
                 )
             self.windows.extend(windows)
@@ -273,74 +287,69 @@ class Cholec80Dataset(Dataset):
         # random sort; no, let the DataLoader shuffle
         # np.random.shuffle(self.windows)
 
-    def _compute_transition_matrix(self):
-        raise RuntimeError("This function is not used anymore")
-        """
-        Compute the phase transition probability matrix.
-
-        Returns:
-            torch.Tensor: A transition matrix of shape [num_classes, num_classes].
-        """
-        num_classes = 7  # Number of phases
-        transition_counts = torch.zeros((num_classes, num_classes))
-
-        # Count transitions across all annotations
-        for annotations in self.video_annotations.values():
-            for i in range(1, len(annotations)):
-                prev_phase = annotations[i - 1][1]
-                next_phase = annotations[i][1]
-                transition_counts[prev_phase, next_phase] += 1
-
-        # Normalize to create probabilities
-        transition_probs = transition_counts / transition_counts.sum(dim=1, keepdim=True)
-
-        # from matplotlib import pyplot as plt
-        # fig, ax = plt.subplots()
-        # ax.matshow(transition_probs)
-        # for (i, j), z in np.ndenumerate(transition_probs):
-        #     ax.text(j, i, '{:0.2f}'.format(z), ha='center', va='center')
-        # plt.savefig("transition_probs.png")
-
-        return transition_probs
-
     def _compute_phase_transition_time(self) -> dict[str, dict[int, float]]:
         """
         For a given index i, compute the remaining time to transition to the next phase.
         Time is given by the number of frames until the next phase transition, multiplied by the target_fps.
         Hence, the result is in seconds. Finally, is converted in minutes, for better readability.
         """
-        time_to_next_phase: dict[str, list[float]] = {}  # {video_name: {frame_index: time_to_next_phase}}
-        # creating signals for each video
+
+        NUM_PHASES = 7
+
+        phase_results = {}
+
         for video_name, annotations in self.video_annotations.items():
-            phases = [phase for _, phase in annotations]
-            # compute the number of frames until the next phase transition.
-            # The phase transition is considered when the phase changes.
-            curr_p = phases[0]
-            indexes_of_change = []
-            for i in range(1, len(phases)):
-                if phases[i] != curr_p:
-                    curr_p = phases[i]
-                    indexes_of_change.append(i)
-            indexes_of_change.append(i + 1)
+            phases = [phase for _, phase in annotations]  # Extract phase annotations
+            num_frames = len(phases)
+            phase_lists = defaultdict(lambda: [0] * num_frames)  # Initialize phase lists with zeros
 
-            # calculate the time to the next phase transition:
-            initial = 0
-            tmp = [0] * len(phases)
-            for i in indexes_of_change:
-                n_elements = i - initial
-                tmp[initial:i] = list(range(n_elements - 1, -1, -1))
-                initial = i
+            # Iterate through each frame
+            for i in range(num_frames):
+                current_phase = phases[i]
 
-            timings = np.asarray(tmp)
-            # now timings are one every 25 second (because self.target_fps is 1)
-            # we need to convert it to the seconds
-            timings = timings * self.target_fps  # now timings are in seconds
-            timings = timings / 60  # now timings are in minutes
+                # Mark 0 for the current phase
+                for phase in range(NUM_PHASES):  # Assuming phases are numbered 1 to 7
+                    if phase == current_phase:
+                        phase_lists[phase][i] = 0
+                    else:
+                        # Count how many frames until this phase appears again
+                        next_occurrence = next((j - i for j in range(i + 1, num_frames) if phases[j] == phase), None)
+                        if next_occurrence is not None:
+                            phase_lists[phase][i] = next_occurrence
+                        else:
+                            # Phase does not appear again, set to maximum (num_frames)
+                            phase_lists[phase][i] = num_frames
+
+            # Convert frame counts to timings
+            timings = np.asarray(list(phase_lists.values()))  # Convert phase lists to numpy array
+            timings = timings * self.target_fps  # Convert frame counts to seconds
+            timings = timings / 60  # Convert seconds to minutes
             timings = timings.tolist()
 
-            time_to_next_phase[video_name] = timings  # {i: val for (i, val) in enumerate(timings)}
+            # Save results for the current video
+            phase_results[video_name] = timings
 
-        return time_to_next_phase
+        # debug plot
+        fig, ax = plt.subplots(7, 2, figsize=(10, 20))
+        for video_name, timings in phase_results.items():
+            fig.suptitle(f"Phase transition time for {video_name}")
+            # first 7 rows, first column, un-normalized
+            # second 7 rows, second column, clamped
+            for i in range(7):
+                ax[i, 0].cla()
+                ax[i, 1].cla()
+                ax[i, 0].plot(timings[i], label=f"{phase_dict_key[i]}")
+                ax[i, 0].set_title(f"{phase_dict_key[i]}")
+                ax[i, 0].set_ylabel("Minutes")
+                ax[i, 0].set_xlabel("Frames")
+                ax[i, 0].legend()
+                ax[i, 1].plot(np.clip(timings[i], 0, 5), label=f"{phase_dict_key[i]}")
+                ax[i, 1].set_title(f"{phase_dict_key[i]}")
+                ax[i, 1].set_ylabel("Minutes")
+                ax[i, 1].set_xlabel("Frames")
+                ax[i, 1].legend()
+            plt.savefig(f"data/cholec80/phase_transition_time_{video_name}.png")
+        return phase_results
 
     def __len__(self):
         return len(self.windows)
@@ -353,7 +362,7 @@ class Cholec80Dataset(Dataset):
 
 def __test__():
     data_dir = "./data/cholec80"
-    dataset = Cholec80Dataset(data_dir, mode="all", seq_len=10, fps=1)
+    dataset = Cholec80Dataset(data_dir, mode="val", seq_len=10, fps=1)
 
     print(f"Number of videos: {len(dataset)}")
     print(dataset[0])

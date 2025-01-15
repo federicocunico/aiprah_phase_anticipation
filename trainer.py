@@ -1,5 +1,5 @@
 from matplotlib import pyplot as plt
-import numpy as np
+# import numpy as np
 from sklearn.metrics import accuracy_score, f1_score
 import torch
 import pytorch_lightning as pl
@@ -47,16 +47,18 @@ class PhaseAnticipationTrainer(pl.LightningModule):
 
         acc = accuracy_score(self.val_y_true, self.val_y_pred)
         mse_loss = torch.nn.functional.mse_loss(
-            torch.as_tensor(self.val_y_pred_regr), torch.as_tensor(self.val_y_true_regr)
+            torch.asarray(self.val_y_pred_regr), torch.as_tensor(self.val_y_true_regr)
         )
         self.log("val_acc", acc)
-        self.log("val_mse_loss", mse_loss)
+        self.log("val_anticip", mse_loss)
 
         self.ax.cla()
         self.ax.set_ylabel("Time to next phase (cap 5)")
         self.ax.set_xlabel("Frames")
-        self.ax.plot(np.asarray(self.val_y_true_regr), label="True", color="blue")
-        self.ax.plot(np.asarray(self.val_y_pred_regr), label="Predicted", color="red")
+        s1 = [a for a in self.val_y_true_regr]
+        s2 = [a for a in self.val_y_pred_regr]
+        self.ax.plot(s1, label="True", color="blue")
+        self.ax.plot(s2, label="Predicted", color="red")
         plt.legend()
         plt.savefig("val_time_phase.png")
 
@@ -75,11 +77,11 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         current_phase, anticipated_phase = self.model(frames)
 
         _, predicted = torch.max(current_phase, 1)
-        self.val_y_true.extend(labels.detach().cpu())
-        self.val_y_pred.extend(predicted.detach().cpu())
+        self.val_y_true.extend(labels.detach().cpu().tolist())
+        self.val_y_pred.extend(predicted.detach().cpu().tolist())
 
-        self.val_y_true_regr.extend(time_to_next_phase.detach().cpu())
-        self.val_y_pred_regr.extend(anticipated_phase.detach().cpu())
+        self.val_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
+        self.val_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
 
         
         loss, loss_phase, loss_anticipation = self.loss_criterion(current_phase, anticipated_phase, labels, time_to_next_phase)
@@ -98,18 +100,20 @@ class PhaseAnticipationTrainer(pl.LightningModule):
     def on_test_epoch_end(self):
         acc = accuracy_score(self.test_y_true, self.test_y_pred)
         f1 = f1_score(self.test_y_true, self.test_y_pred, average="weighted")
-        mse_loss = self.criterion_anticipation(
+        mse_loss = torch.nn.functional.mse_loss(
             torch.as_tensor(self.test_y_pred_regr), torch.as_tensor(self.test_y_true_regr)
         )
         self.log("test_f1", f1)
         self.log("test_acc", acc)
-        self.log("test_mse_loss", mse_loss)
+        self.log("test_anticip", mse_loss)
 
         self.ax.cla()
         self.ax.set_ylabel("Time to next phase (cap 5)")
         self.ax.set_xlabel("Frames")
-        self.ax.plot(np.asarray(self.test_y_true_regr), label="True", color="blue")
-        self.ax.plot(np.asarray(self.test_y_pred_regr), label="Predicted", color="red")
+        s1 = [a for a in self.test_y_true_regr]
+        s2 = [a for a in self.test_y_pred_regr]
+        self.ax.plot(s1, label="True", color="blue")
+        self.ax.plot(s2, label="Predicted", color="red")
         plt.legend()
         plt.savefig("test_time_phase.png")
 
@@ -128,11 +132,11 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         current_phase, anticipated_phase = self.model(frames)
 
         _, predicted = torch.max(current_phase, 1)
-        self.test_y_true.extend(labels.detach().cpu())
-        self.test_y_pred.extend(predicted.detach().cpu())
+        self.test_y_true.extend(labels.detach().cpu().tolist())
+        self.test_y_pred.extend(predicted.detach().cpu().tolist())
 
-        self.test_y_true_regr.extend(time_to_next_phase.detach().cpu())
-        self.test_y_pred_regr.extend(anticipated_phase.detach().cpu())
+        self.test_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
+        self.test_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
 
         # loss_phase: torch.Tensor = self.criterion_phase(current_phase, labels)
         # loss_anticipation: torch.Tensor = self.criterion_anticipation(anticipated_phase.reshape(-1), time_to_next_phase)

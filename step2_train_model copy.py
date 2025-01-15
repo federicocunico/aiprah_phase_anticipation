@@ -11,7 +11,7 @@ import wandb
 from datasets.cholec80 import Cholec80Dataset
 from models.membank_model import MemBankResNetLSTM
 from models.memory_bank import MemoryBank
-from models.temporal_model import TemporalResNetLSTM
+from models.temporal_model_v1 import TemporalResNetLSTM
 from memory_bank_utils import create_memorybank, get_long_range_feature_clip, get_long_range_feature_clip_online
 
 
