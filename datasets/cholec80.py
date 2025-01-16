@@ -250,6 +250,8 @@ class Cholec80Dataset(Dataset):
             self.video_annotations[video_name] = anns
 
         # create a list of "windows" of frames
+        self.F_steps = 10  # number of future steps to predict
+        self.F_sampling = 60  # every 60 ticks (1 minute)
         self.windows = []
         for video_name, frame_names in tqdm(self.video_paths_frames.items(), desc="Creating windows"):
             windows = []
@@ -259,28 +261,24 @@ class Cholec80Dataset(Dataset):
                 frame_window = frame_names[i : i + self.seq_len]
                 all_frame_labels = self.video_annotations[video_name][i : i + self.seq_len]
 
-                # future_window = frame_names[i + self.seq_len : i + self.seq_len*2]
-                if i + self.seq_len * 2 >= len(frame_names):
-                    all_future_labels = all_frame_labels  # final phase is the same as the last frame
-                else:
-                    all_future_labels = self.video_annotations[video_name][i + self.seq_len : i + self.seq_len * 2]
-
-                _, future_label = all_future_labels[-1]
                 _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
                 frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
                 ph_trans_time_dense = all_ph_trans_time[:, frame_indexes]
                 ph_trans_time = ph_trans_time_dense[:, -1]
+
+                targets_future = create_future_classification_targets(
+                    all_ph_trans_time, self.seq_len, self.F_steps, self.F_sampling, i
+                )  # [T, F, NUM_CLASSES]
                 windows.append(
                     {
-                        "video_name": video_name,
-                        "frames_filepath": frame_window,
-                        "frames_indexes": torch.asarray(frame_indexes),
-                        "phase_label": torch.asarray(frame_label),
-                        "phase_label_dense": torch.asarray([f[1] for f in all_frame_labels]),
-                        "future_phase": torch.asarray(future_label),
-                        "future_phase_dense": torch.asarray([f[1] for f in all_future_labels]),
-                        "time_to_next_phase_dense": ph_trans_time_dense,
-                        "time_to_next_phase": ph_trans_time,
+                        "video_name": video_name,  # str
+                        "frames_filepath": frame_window,  # [T] list of str
+                        "frames_indexes": torch.asarray(frame_indexes),  # [T] list of int
+                        "phase_label": torch.asarray(frame_label),  # int (label for the last frame in the window)
+                        "phase_label_dense": torch.asarray([f[1] for f in all_frame_labels]),  # [T] list of int
+                        "time_to_next_phase_dense": ph_trans_time_dense,  # [NUM_CLASSES, T] list of float; time to next phase for each frame
+                        "time_to_next_phase": ph_trans_time,  # [NUM_CLASSES] list of float; time to next phase for the last frame
+                        "future_targets": targets_future,  # [T, F, NUM_CLASSES] list of int; targets for classification
                     }
                 )
             self.windows.extend(windows)
@@ -369,6 +367,39 @@ class Cholec80Dataset(Dataset):
         metadata = self.windows[idx]
         frames = torch.stack([self.transform(Image.open(f)) for f in metadata["frames_filepath"]])
         return frames, metadata
+
+
+def create_future_classification_targets(all_ph_trans_time, seq_len: int, F: int, sampling: int, i: int):
+    """
+    Create SWAG targets for classification from dataset entry.
+
+    Args:
+        all_ph_trans_time (torch.Tensor): [NUM_CLASSES, TOTAL_FRAMES] tensor of floats;
+                                         time to the next phase for each frame.
+        seq_len (int): The length of the current window (T).
+        F (int): Number of future steps to predict.
+        i (int): The current index in the dataset loop.
+
+    Returns:
+        torch.Tensor: [seq_len, F, NUM_CLASSES] tensor containing the SWAG targets.
+    """
+    NUM_CLASSES, TOTAL_FRAMES = all_ph_trans_time.shape
+
+    # Initialize the target tensor
+    swag_targets = torch.zeros((seq_len, F, NUM_CLASSES), dtype=torch.int64)
+
+    # Loop through each frame in the current window
+    for t in range(seq_len):
+        current_index = i + t  # Current frame index
+
+        for f in range(1, F + 1):  # Future steps (1 to F)
+            future_index = current_index + f * sampling  # Adjust by the sampling rate
+
+            if future_index < TOTAL_FRAMES:
+                # Check if the class is maintained (time-to-next-phase is 0)
+                swag_targets[t, f - 1, :] = (all_ph_trans_time[:, future_index] == 0).int()
+
+    return swag_targets
 
 
 def __test__():
