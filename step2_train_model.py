@@ -27,8 +27,8 @@ def train_model():
     # Hyperparameters
     # -------------------
     torch.set_float32_matmul_precision('high')  # 'high' or 'medium'; for RTX GPUs
-    batch_size = 16  # 16
-    seq_len = 30 # 10
+    batch_size = 8  #16  # 16
+    seq_len = 10 # 30 # 10
     epochs = 30
     target_fps = 1
     num_classes = 7

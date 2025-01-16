@@ -214,7 +214,7 @@ class Cholec80Dataset(Dataset):
         # self.transition_matrix = self._compute_transition_matrix()
         self.phase_transition_time = self._compute_phase_transition_time()
 
-        for i in tqdm(range(num_videos), desc="Loading videos"):
+        for i in range(num_videos):
             video_path = self.video_paths[i]
             annotation_path = self.label_paths[i]
             assert os.path.exists(video_path), f"Video file {video_path} does not exist"
@@ -251,8 +251,10 @@ class Cholec80Dataset(Dataset):
 
         # create a list of "windows" of frames
         self.windows = []
-        for video_name, frame_names in self.video_paths_frames.items():
+        for video_name, frame_names in tqdm(self.video_paths_frames.items(), desc="Creating windows"):
             windows = []
+            all_ph_trans_time = torch.asarray(self.phase_transition_time[video_name])  # [NUM_CLASSES, NUM_FRAMES]
+
             for i in range(len(frame_names) - self.seq_len):
                 frame_window = frame_names[i : i + self.seq_len]
                 all_frame_labels = self.video_annotations[video_name][i : i + self.seq_len]
@@ -266,7 +268,6 @@ class Cholec80Dataset(Dataset):
                 _, future_label = all_future_labels[-1]
                 _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
                 frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
-                all_ph_trans_time = torch.asarray(self.phase_transition_time[video_name])  # [NUM_CLASSES, NUM_FRAMES]
                 ph_trans_time_dense = all_ph_trans_time[:, frame_indexes]
                 ph_trans_time = ph_trans_time_dense[:, -1]
                 windows.append(
@@ -295,60 +296,70 @@ class Cholec80Dataset(Dataset):
         """
 
         NUM_PHASES = 7
+        dst = os.path.join(self.root_dir, f"phase_transition_{self.mode}.pkl")
+        if os.path.isfile(dst):
+            return torch.load(dst, weights_only=False)
+        else:
+            phase_results = {}
 
-        phase_results = {}
+            for video_name, annotations in tqdm(self.video_annotations.items(), desc="Computing phase annotations"):
+                phases = [phase for _, phase in annotations]  # Extract phase annotations
+                num_frames = len(phases)
+                phase_lists = defaultdict(lambda: [0] * num_frames)  # Initialize phase lists with zeros
 
-        for video_name, annotations in self.video_annotations.items():
-            phases = [phase for _, phase in annotations]  # Extract phase annotations
-            num_frames = len(phases)
-            phase_lists = defaultdict(lambda: [0] * num_frames)  # Initialize phase lists with zeros
+                # Iterate through each frame
+                for i in range(num_frames):
+                    current_phase = phases[i]
 
-            # Iterate through each frame
-            for i in range(num_frames):
-                current_phase = phases[i]
-
-                # Mark 0 for the current phase
-                for phase in range(NUM_PHASES):  # Assuming phases are numbered 1 to 7
-                    if phase == current_phase:
-                        phase_lists[phase][i] = 0
-                    else:
-                        # Count how many frames until this phase appears again
-                        next_occurrence = next((j - i for j in range(i + 1, num_frames) if phases[j] == phase), None)
-                        if next_occurrence is not None:
-                            phase_lists[phase][i] = next_occurrence
+                    # Mark 0 for the current phase
+                    for phase in range(NUM_PHASES):  # Assuming phases are numbered 1 to 7
+                        if phase == current_phase:
+                            phase_lists[phase][i] = 0
                         else:
-                            # Phase does not appear again, set to maximum (num_frames)
-                            phase_lists[phase][i] = num_frames
+                            # Count how many frames until this phase appears again
+                            next_occurrence = next(
+                                (j - i for j in range(i + 1, num_frames) if phases[j] == phase), None
+                            )
+                            if next_occurrence is not None:
+                                phase_lists[phase][i] = next_occurrence
+                            else:
+                                # Phase does not appear again, set to maximum (num_frames)
+                                phase_lists[phase][i] = num_frames
 
-            # Convert frame counts to timings
-            timings = np.asarray(list(phase_lists.values()))  # Convert phase lists to numpy array
-            timings = timings * self.target_fps  # Convert frame counts to seconds
-            timings = timings / 60  # Convert seconds to minutes
-            timings = timings.tolist()
+                # Convert frame counts to timings
+                timings = np.asarray(list(phase_lists.values()))  # Convert phase lists to numpy array
+                timings = timings * self.target_fps  # Convert frame counts to seconds
+                timings = timings / 60  # Convert seconds to minutes
+                timings = timings.tolist()
 
-            # Save results for the current video
-            phase_results[video_name] = timings
+                # Save results for the current video
+                phase_results[video_name] = timings
+
+            with open(dst, "wb") as f:
+                torch.save(phase_results, f)
 
         # debug plot
-        fig, ax = plt.subplots(7, 2, figsize=(10, 20))
-        for video_name, timings in phase_results.items():
-            fig.suptitle(f"Phase transition time for {video_name}")
-            # first 7 rows, first column, un-normalized
-            # second 7 rows, second column, clamped
-            for i in range(7):
-                ax[i, 0].cla()
-                ax[i, 1].cla()
-                ax[i, 0].plot(timings[i], label=f"{phase_dict_key[i]}")
-                ax[i, 0].set_title(f"{phase_dict_key[i]}")
-                ax[i, 0].set_ylabel("Minutes")
-                ax[i, 0].set_xlabel("Frames")
-                ax[i, 0].legend()
-                ax[i, 1].plot(np.clip(timings[i], 0, 5), label=f"{phase_dict_key[i]}")
-                ax[i, 1].set_title(f"{phase_dict_key[i]}")
-                ax[i, 1].set_ylabel("Minutes")
-                ax[i, 1].set_xlabel("Frames")
-                ax[i, 1].legend()
-            plt.savefig(f"data/cholec80/phase_transition_time_{video_name}.png")
+        if False:
+            fig, ax = plt.subplots(7, 2, figsize=(10, 20))
+            for video_name, timings in phase_results.items():
+                fig.suptitle(f"Phase transition time for {video_name}")
+                # first 7 rows, first column, un-normalized
+                # second 7 rows, second column, clamped
+                for i in range(7):
+                    ax[i, 0].cla()
+                    ax[i, 1].cla()
+                    ax[i, 0].plot(timings[i], label=f"{phase_dict_key[i]}")
+                    ax[i, 0].set_title(f"{phase_dict_key[i]}")
+                    ax[i, 0].set_ylabel("Minutes")
+                    ax[i, 0].set_xlabel("Frames")
+                    ax[i, 0].legend()
+                    ax[i, 1].plot(np.clip(timings[i], 0, 5), label=f"{phase_dict_key[i]}")
+                    ax[i, 1].set_title(f"{phase_dict_key[i]}")
+                    ax[i, 1].set_ylabel("Minutes")
+                    ax[i, 1].set_xlabel("Frames")
+                    ax[i, 1].legend()
+                plt.savefig(f"data/cholec80/phase_transition_time_{video_name}.png")
+            fig.close()
         return phase_results
 
     def __len__(self):

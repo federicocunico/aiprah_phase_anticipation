@@ -1,9 +1,9 @@
 from matplotlib import pyplot as plt
+
 # import numpy as np
 from sklearn.metrics import accuracy_score, f1_score
 import torch
 import pytorch_lightning as pl
-
 
 
 class PhaseAnticipationTrainer(pl.LightningModule):
@@ -12,10 +12,11 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         self.model: torch.nn.Module = model
         self.loss_criterion: torch.nn.Module = loss_criterion
 
-        self.ax = plt.subplot(111)  # Create a subplot for timings
+        # self.ax = plt.subplot(111)  # Create a subplot for timings
+        fig, self.ax = plt.subplots(1, 1, figsize=(15, 5))
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
         return optimizer
 
     def training_step(self, batch, batch_idx):
@@ -30,7 +31,9 @@ class PhaseAnticipationTrainer(pl.LightningModule):
 
         current_phase, anticipated_phase = self.model(frames)
 
-        loss, loss_phase, loss_anticipation = self.loss_criterion(current_phase, anticipated_phase, labels, time_to_next_phase)
+        loss, loss_phase, loss_anticipation = self.loss_criterion(
+            current_phase, anticipated_phase, labels, time_to_next_phase
+        )
 
         self.log("train_loss", loss)
         self.log("train_loss_phase", loss_phase)
@@ -55,10 +58,8 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         self.ax.cla()
         self.ax.set_ylabel("Time to next phase (cap 5)")
         self.ax.set_xlabel("Frames")
-        s1 = [a for a in self.val_y_true_regr]
-        s2 = [a for a in self.val_y_pred_regr]
-        self.ax.plot(s1, label="True", color="blue")
-        self.ax.plot(s2, label="Predicted", color="red")
+        self.ax.plot(self.val_y_true_regr, label="True", color="blue")
+        self.ax.plot(self.val_y_pred_regr, label="Predicted", color="red")
         plt.legend()
         plt.savefig("val_time_phase.png")
 
@@ -83,8 +84,9 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         self.val_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
         self.val_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
 
-        
-        loss, loss_phase, loss_anticipation = self.loss_criterion(current_phase, anticipated_phase, labels, time_to_next_phase)
+        loss, loss_phase, loss_anticipation = self.loss_criterion(
+            current_phase, anticipated_phase, labels, time_to_next_phase
+        )
 
         self.log("val_loss", loss)
         self.log("val_loss_phase", loss_phase)
@@ -110,13 +112,10 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         self.ax.cla()
         self.ax.set_ylabel("Time to next phase (cap 5)")
         self.ax.set_xlabel("Frames")
-        s1 = [a for a in self.test_y_true_regr]
-        s2 = [a for a in self.test_y_pred_regr]
-        self.ax.plot(s1, label="True", color="blue")
-        self.ax.plot(s2, label="Predicted", color="red")
+        self.ax.plot(self.test_y_true_regr, label="True", color="blue")
+        self.ax.plot(self.test_y_pred_regr, label="Predicted", color="red")
         plt.legend()
         plt.savefig("test_time_phase.png")
-
 
         self.test_y_true.clear()
         self.test_y_pred.clear()
@@ -141,7 +140,9 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         # loss_phase: torch.Tensor = self.criterion_phase(current_phase, labels)
         # loss_anticipation: torch.Tensor = self.criterion_anticipation(anticipated_phase.reshape(-1), time_to_next_phase)
 
-        loss, loss_phase, loss_anticipation = self.loss_criterion(current_phase, anticipated_phase, labels, time_to_next_phase)
+        loss, loss_phase, loss_anticipation = self.loss_criterion(
+            current_phase, anticipated_phase, labels, time_to_next_phase
+        )
 
         self.log("test_loss", loss)
         self.log("test_loss_phase", loss_phase)

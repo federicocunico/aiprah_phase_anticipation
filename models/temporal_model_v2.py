@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torchvision.models import vit_b_16, ViT_B_16_Weights
+from torchvision.models import resnet50, ResNet50_Weights, resnet18, ResNet18_Weights
 
 from models.non_local import TimeConv
 
@@ -176,9 +177,6 @@ class Identity(nn.Module):
 #         return ph, ant
 
 
-import torch
-import torch.nn as nn
-from torchvision.models import resnet50, ResNet50_Weights, resnet18, ResNet18_Weights
 
 
 # class TemporalAnticipationModel(nn.Module):
