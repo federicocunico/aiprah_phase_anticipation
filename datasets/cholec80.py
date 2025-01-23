@@ -2,6 +2,7 @@ import glob
 from collections import defaultdict
 import os
 import shutil
+import time
 import cv2
 from matplotlib import pyplot as plt
 import numpy as np
@@ -266,9 +267,12 @@ class Cholec80Dataset(Dataset):
                 ph_trans_time_dense = all_ph_trans_time[:, frame_indexes]
                 ph_trans_time = ph_trans_time_dense[:, -1]
 
-                targets_future = create_future_classification_targets(
-                    all_ph_trans_time, self.seq_len, self.F_steps, self.F_sampling, i
-                )  # [T, F, NUM_CLASSES]
+                # t = time.time()
+                # targets_future = create_future_classification_targets(
+                #     all_ph_trans_time, self.seq_len, self.F_steps, self.F_sampling, i
+                # )  # [T, F, NUM_CLASSES]
+                targets_future = torch.zeros((self.seq_len, self.F_steps, 7), dtype=torch.int64)
+                # print("elapsed", time.time() - t)
                 windows.append(
                     {
                         "video_name": video_name,  # str

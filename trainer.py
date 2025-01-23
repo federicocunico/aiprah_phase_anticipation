@@ -29,11 +29,25 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         time_to_next_phase = metadata["time_to_next_phase"]
         time_to_next_phase = torch.clamp(time_to_next_phase, 0, self.model.time_horizon)
 
-        current_phase, anticipated_phase = self.model(frames)
-
-        loss, loss_phase, loss_anticipation = self.loss_criterion(
+        outputs = self.model(frames)
+        
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            current_phase, anticipated_phase = outputs
+            loss, loss_phase, loss_anticipation = self.loss_criterion(
             current_phase, anticipated_phase, labels, time_to_next_phase
         )
+        else:
+            current_logits, future_logits, regression_logits = outputs
+
+            current_targets = metadata["phase_label"]  # [B, C]
+            future_targets = metadata["future_targets"]  # [B, T, F, C]
+            regression_targets = metadata["time_to_next_phase"]  # [B, C]
+            loss_dict = self.loss_criterion(
+                current_logits, future_logits, regression_logits, current_targets, future_targets, regression_targets
+            )
+            loss = loss_dict["total_loss"]
+            loss_phase = loss_dict["classification_loss"]
+            loss_anticipation = loss_dict["regression_loss"]
 
         self.log("train_loss", loss)
         self.log("train_loss_phase", loss_phase)
@@ -75,18 +89,32 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         time_to_next_phase = metadata["time_to_next_phase"]
         time_to_next_phase = torch.clamp(time_to_next_phase, 0, self.model.time_horizon)
 
-        current_phase, anticipated_phase = self.model(frames)
+        outputs = self.model(frames)
+
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            current_phase, anticipated_phase = outputs
+            loss, loss_phase, loss_anticipation = self.loss_criterion(
+                current_phase, anticipated_phase, labels, time_to_next_phase
+            )
+        else:
+            current_phase, future_logits, regression_logits = outputs
+
+            current_targets = metadata["phase_label"]  # [B, C]
+            future_targets = metadata["future_targets"]  # [B, T, F, C]
+            regression_targets = metadata["time_to_next_phase"]  # [B, C]
+            loss_dict = self.loss_criterion(
+                current_phase, future_logits, regression_logits, current_targets, future_targets, regression_targets
+            )
+            loss = loss_dict["total_loss"]
+            loss_phase = loss_dict["classification_loss"]
+            loss_anticipation = loss_dict["regression_loss"]
 
         _, predicted = torch.max(current_phase, 1)
         self.val_y_true.extend(labels.detach().cpu().tolist())
         self.val_y_pred.extend(predicted.detach().cpu().tolist())
 
-        self.val_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
-        self.val_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
-
-        loss, loss_phase, loss_anticipation = self.loss_criterion(
-            current_phase, anticipated_phase, labels, time_to_next_phase
-        )
+        # self.val_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
+        # self.val_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
 
         self.log("val_loss", loss)
         self.log("val_loss_phase", loss_phase)
@@ -128,21 +156,39 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         time_to_next_phase = metadata["time_to_next_phase"]
         time_to_next_phase = torch.clamp(time_to_next_phase, 0, self.model.time_horizon)
 
-        current_phase, anticipated_phase = self.model(frames)
+        outputs = self.model(frames)
+
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            current_phase, anticipated_phase = outputs
+            loss, loss_phase, loss_anticipation = self.loss_criterion(
+                current_phase, anticipated_phase, labels, time_to_next_phase
+            )
+        else:
+            current_phase, future_logits, regression_logits = outputs
+
+            current_targets = metadata["phase_label"]  # [B, C]
+            future_targets = metadata["future_targets"]  # [B, T, F, C]
+            regression_targets = metadata["time_to_next_phase"]  # [B, C]
+            loss_dict = self.loss_criterion(
+                current_phase, future_logits, regression_logits, current_targets, future_targets, regression_targets
+            )
+            loss = loss_dict["total_loss"]
+            loss_phase = loss_dict["classification_loss"]
+            loss_anticipation = loss_dict["regression_loss"]
 
         _, predicted = torch.max(current_phase, 1)
         self.test_y_true.extend(labels.detach().cpu().tolist())
         self.test_y_pred.extend(predicted.detach().cpu().tolist())
 
-        self.test_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
-        self.test_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
+        # self.test_y_true_regr.extend(time_to_next_phase.detach().cpu().tolist())
+        # self.test_y_pred_regr.extend(anticipated_phase.detach().cpu().tolist())
 
         # loss_phase: torch.Tensor = self.criterion_phase(current_phase, labels)
         # loss_anticipation: torch.Tensor = self.criterion_anticipation(anticipated_phase.reshape(-1), time_to_next_phase)
 
-        loss, loss_phase, loss_anticipation = self.loss_criterion(
-            current_phase, anticipated_phase, labels, time_to_next_phase
-        )
+        # loss, loss_phase, loss_anticipation = self.loss_criterion(
+        #     current_phase, anticipated_phase, labels, time_to_next_phase
+        # )
 
         self.log("test_loss", loss)
         self.log("test_loss_phase", loss_phase)

@@ -8,7 +8,8 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, confusion_matrix
 from tqdm import tqdm
 from losses.loss import ModelLoss
-from models.temporal_model_v2 import TemporalAnticipationModel
+from losses.swag_loss import SWAGLoss
+from losses.ce_regr_loss import CERegrLoss
 from trainer import PhaseAnticipationTrainer
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -17,10 +18,14 @@ from datasets.cholec80 import Cholec80Dataset
 from models.membank_model import MemBankResNetLSTM
 from models.memory_bank import MemoryBank
 from models.temporal_model_v1 import TemporalResNetLSTM
+# from models.temporal_model_v2 import TemporalAnticipationModel
+# from models.temporal_model_v3 import TemporalAnticipationModel
+from models.temporal_model_v4 import TemporalAnticipationModel
 from memory_bank_utils import create_memorybank, get_long_range_feature_clip, get_long_range_feature_clip_online
 
 
 def train_model():
+    seed_everything(0)
 
     wandb_logger = WandbLogger(name="stage2", project="cholec80")
     # -------------------
@@ -28,8 +33,8 @@ def train_model():
     # -------------------
     torch.set_float32_matmul_precision('high')  # 'high' or 'medium'; for RTX GPUs
     batch_size = 8  #16  # 16
-    seq_len = 10 # 30 # 10
-    epochs = 30
+    seq_len = 30 # 10
+    epochs = 200
     target_fps = 1
     num_classes = 7
     multitask_strategy = "none"  # "adaptive_weighting" # "none"
@@ -71,13 +76,15 @@ def train_model():
     # -------------------
     # Train
     # -------------------
-    loss_criterion = ModelLoss(l1=l1, l2=l2, multitask_strategy=multitask_strategy)
+    # loss_criterion = ModelLoss(l1=l1, l2=l2, multitask_strategy=multitask_strategy)
+    # loss_criterion = SWAGLoss(10, 5)
+    loss_criterion = CERegrLoss()
     pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=loss_criterion)
 
     ckpt_save = ModelCheckpoint(
         filename="stage2_model_best",
-        monitor="val_acc",
-        mode="max",
+        monitor="val_loss_anticipation",
+        mode="min",
         save_top_k=1,
     )
     trainer = Trainer(

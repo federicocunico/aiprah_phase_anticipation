@@ -10,6 +10,7 @@ class Identity(nn.Module):
     def forward(self, x):
         return x
 
+
 class TemporalAnticipationModel(nn.Module):
     def __init__(self, sequence_length: int, num_classes: int = 7, time_horizon: int = 5, future_steps: int = 10):
         super(TemporalAnticipationModel, self).__init__()
@@ -83,46 +84,54 @@ class TemporalAnticipationModel(nn.Module):
         return current_logits, future_logits, regression_logits
 
 
-
 def __test__():
 
     from losses.swag_loss import SWAGLoss
+    from datasets.cholec80 import Cholec80Dataset
+    from torch.utils.data import DataLoader
 
-    B, T, C, H, W = 1, 10, 3, 224, 224  # Batch size, sequence length, channels, height, width
-    num_classes = 4
-    future_steps = 3
+    B, T, C, H, W = 5, 10, 3, 224, 224  # Batch size, sequence length, channels, height, width
+    num_classes = 7
+    future_steps = 10
     time_horizon = 5
 
-    # Mock input
-    xin = torch.randn(B, T, C, H, W)
+    # # Mock input
+    # xin = torch.randn(B, T, C, H, W)
 
-    # Mock data loader batch
-    batch = {
-        "frames_filepath": [f"frame_{i}.jpg" for i in range(T)],
-        "frames_indexes": torch.arange(T),
-        "phase_label": torch.tensor(2),
-        "phase_label_dense": torch.tensor([0, 1, 1, 2, 2, 2, 3, 3, 3, 3]),
-        "time_to_next_phase_dense": torch.tensor([
-            [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 5.0, 4.0, 3.0, 2.0],
-            [3.0, 2.0, 1.0, 0.0, 4.0, 3.0, 2.0, 1.0, 0.0, 0.0],
-            [6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0, 5.0, 4.0],
-            [2.0, 1.0, 0.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 0.0],
-        ]),
-        "future_targets": torch.randint(0, 2, (T, future_steps, num_classes)),
-        "time_to_next_phase": torch.tensor([2.0, 0.0, 4.0, 0.0]),
-    }
+    # # Mock data loader batch
+    # batch = {
+    #     "frames_filepath": [f"frame_{i}.jpg" for i in range(T)],
+    #     "frames_indexes": torch.arange(T),
+    #     "phase_label": torch.tensor(2),
+    #     "phase_label_dense": torch.tensor([0, 1, 1, 2, 2, 2, 3, 3, 3, 3]),
+    #     "time_to_next_phase_dense": torch.tensor([
+    #         [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 5.0, 4.0, 3.0, 2.0],
+    #         [3.0, 2.0, 1.0, 0.0, 4.0, 3.0, 2.0, 1.0, 0.0, 0.0],
+    #         [6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0, 5.0, 4.0],
+    #         [2.0, 1.0, 0.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 0.0],
+    #     ]),
+    #     "future_targets": torch.randint(0, 2, (T, future_steps, num_classes)),
+    #     "time_to_next_phase": torch.tensor([2.0, 0.0, 4.0, 0.0]),
+    # }
+
+    d = Cholec80Dataset(root_dir="./data/cholec80", mode="demo_train", seq_len=T,  fps=1)
+    loader = DataLoader(d, batch_size=B, shuffle=True, num_workers=0, pin_memory=False)
+
+    xin, batch = next(iter(loader))
 
     # Initialize model and loss
-    model = TemporalAnticipationModel(sequence_length=T, num_classes=num_classes, time_horizon=time_horizon, future_steps=future_steps)
+    model = TemporalAnticipationModel(
+        sequence_length=T, num_classes=num_classes, time_horizon=time_horizon, future_steps=future_steps
+    )
     swag_loss = SWAGLoss(future_steps=future_steps, time_horizon=time_horizon)
 
     # Forward pass
     current_logits, future_logits, regression_logits = model(xin)
 
     # Compute loss
-    current_targets = torch.zeros(B, num_classes).scatter_(1, torch.tensor([batch["phase_label"]]).unsqueeze(0), 1)
-    future_targets = batch["future_targets"].unsqueeze(0)  # [B, T, F, C]
-    regression_targets = batch["time_to_next_phase"].unsqueeze(0)  # [B, C]
+    current_targets = batch["phase_label"]  # [B]
+    future_targets = batch["future_targets"]  # [B, T, F, C]
+    regression_targets = batch["time_to_next_phase"]  # [B, C]
 
     loss_dict = swag_loss(
         current_logits, future_logits, regression_logits, current_targets, future_targets, regression_targets
@@ -131,6 +140,7 @@ def __test__():
     print("Loss Components:")
     for key, value in loss_dict.items():
         print(f"{key}: {value.item()}")
+
 
 if __name__ == "__main__":
     __test__()
