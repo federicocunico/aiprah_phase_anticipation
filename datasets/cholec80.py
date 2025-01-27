@@ -359,9 +359,10 @@ class Cholec80Dataset(Dataset):
                     ax[i, 1].set_title(f"{phase_dict_key[i]}")
                     ax[i, 1].set_ylabel("Minutes")
                     ax[i, 1].set_xlabel("Frames")
-                    ax[i, 1].legend()
+                    # ax[i, 1].legend()
+                plt.tight_layout()
                 plt.savefig(f"data/cholec80/phase_transition_time_{video_name}.png")
-            fig.close()
+            plt.close()
         return phase_results
 
     def __len__(self):
@@ -417,13 +418,56 @@ def __test__():
 
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
 
+    # debug plots
+    if False:
+        phase_results = dataset.phase_transition_time
+        dtype = torch.bfloat16
+        fig, ax = plt.subplots(7, 2, figsize=(10, 20))
+        for video_name, timings in phase_results.items():
+            timings = torch.tensor(timings, dtype=dtype)
+            timings = timings.tolist()
+            fig.suptitle(f"Phase transition time for {video_name}")
+            # first 7 rows, first column, un-normalized
+            # second 7 rows, second column, clamped
+            for i in range(7):
+                ax[i, 0].cla()
+                ax[i, 1].cla()
+                ax[i, 0].plot(timings[i], label=f"{phase_dict_key[i]}")
+                ax[i, 0].set_title(f"{phase_dict_key[i]}")
+                ax[i, 0].set_ylabel("Minutes")
+                ax[i, 0].set_xlabel("Frames")
+                ax[i, 0].legend()
+                ax[i, 1].plot(np.clip(timings[i], 0, 5), label=f"{phase_dict_key[i]}")
+                ax[i, 1].set_title(f"{phase_dict_key[i]}")
+                ax[i, 1].set_ylabel("Minutes")
+                ax[i, 1].set_xlabel("Frames")
+                # ax[i, 1].legend()
+            plt.tight_layout()
+            plt.savefig(f"data/cholec80/phase_transition_time_{video_name}_{str(dtype)}.png")
+        plt.close()
+        
     for i, batch in enumerate(dataloader):
         frames, metadata = batch
-        print(f"Batch {i}")
-        print(frames.shape)
-        print(metadata["phase_label"])
-        break
 
+        time_to_next_phase = metadata["time_to_next_phase"]
+        # time_to_next_phase = torch.clamp(time_to_next_phase, 0, 5)
+
+        bfloat16 = torch.tensor(time_to_next_phase, dtype=torch.bfloat16)      
+        float16 = time_to_next_phase.half()
+        float32 = torch.tensor(time_to_next_phase, dtype=torch.float32)
+
+        for n in [bfloat16, float16, float32]:
+            diff = torch.abs(time_to_next_phase - n) # diff in minutes
+            diff_seconds = diff * 60
+            print(f"Type: {n.dtype}, Min (s): {diff_seconds.min()}, Max (s): {diff_seconds.max()}")
+            # print("Diff in minutes", diff)
+            print("Diff in seconds:", diff_seconds)
+
+        print(f"Batch {i}: {frames.shape}")
+
+    # Cholec80Dataset(data_dir, mode="val", seq_len=10, fps=1)
+    # Cholec80Dataset(data_dir, mode="test", seq_len=10, fps=1)
+    # Cholec80Dataset(data_dir, mode="train", seq_len=10, fps=1)
 
 if __name__ == "__main__":
     __test__()

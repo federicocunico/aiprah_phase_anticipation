@@ -10,6 +10,7 @@ from tqdm import tqdm
 from losses.loss import ModelLoss
 from losses.swag_loss import SWAGLoss
 from losses.ce_regr_loss import CERegrLoss
+from losses.weighted_regr_loss import WeightedMSELoss
 from trainer import PhaseAnticipationTrainer
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint

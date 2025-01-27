@@ -1,11 +1,13 @@
 import torch
 
+from losses.weighted_regr_loss import WeightedMSELoss
+
 
 class CERegrLoss(torch.nn.Module):
     def __init__(self):
         super(CERegrLoss, self).__init__()
         self.ce_loss = torch.nn.CrossEntropyLoss()
-        self.regr_loss = torch.nn.MSELoss()
+        self.regr_loss = WeightedMSELoss() # torch.nn.MSELoss()
 
     def forward(self, phase_pred, time_pred, phase_gt, time_gt):
         loss_phase = self.ce_loss(phase_pred, phase_gt)

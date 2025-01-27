@@ -34,8 +34,8 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         if isinstance(outputs, tuple) and len(outputs) == 2:
             current_phase, anticipated_phase = outputs
             loss, loss_phase, loss_anticipation = self.loss_criterion(
-            current_phase, anticipated_phase, labels, time_to_next_phase
-        )
+                current_phase, anticipated_phase, labels, time_to_next_phase
+            )
         else:
             current_logits, future_logits, regression_logits = outputs
 

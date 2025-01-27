@@ -25,13 +25,33 @@ class AttentionPooling(torch.nn.Module):
         super().__init__()
         self.attention_weights = torch.nn.Linear(input_dim, 1)  # Learn weights for each time step
 
+        # init
+        torch.nn.init.xavier_uniform_(self.attention_weights.weight)
+
     def forward(self, features: torch.Tensor):
-        B, T, E = features.size()  # [B, T, E]
+        # B, T, E = features.size()  # [B, T, E]
         features = features.transpose(0, 1)  # [T, B, E]
         attn_scores = self.attention_weights(features)  # [T, B, 1]
         attn_scores = torch.softmax(attn_scores, dim=0)  # Normalize over time dimension (T)
         pooled_features = (features * attn_scores).sum(dim=0)  # Weighted sum: [B, E]
         return pooled_features, attn_scores
+
+
+class MeanAttentionPooling(torch.nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.attention_weights = torch.nn.Linear(input_dim, 1)
+
+        # init
+        torch.nn.init.xavier_uniform_(self.attention_weights.weight)
+
+    def forward(self, features):
+        # output: [B, E]
+        # B, T, E = features.size()  # [B, T, E]
+        mean_features = features.mean(dim=1)  # [B, E] - global mean pooling
+        attn_scores = torch.softmax(self.attention_weights(mean_features), dim=-1)
+        refined_features = mean_features * attn_scores
+        return refined_features
 
 
 class Identity(nn.Module):
@@ -55,7 +75,8 @@ class TemporalAnticipationModel(nn.Module):
 
         self.embedding_dim = 512  # output of backbone
         self.self_attn = SelfAttention(embed_dim=self.embedding_dim, num_heads=2)
-        self.pooler_attn = AttentionPooling(input_dim=self.embedding_dim)
+        # self.pooler_attn = AttentionPooling(input_dim=self.embedding_dim)
+        self.pooler_mean = MeanAttentionPooling(input_dim=self.embedding_dim)
 
         self.regressor = torch.nn.Sequential(
             torch.nn.Linear(self.embedding_dim, 1024),  # First layer
@@ -76,7 +97,8 @@ class TemporalAnticipationModel(nn.Module):
         spatio_temporal_features = self.backbone.get_features(x)  # [B*T, 512]
         spatio_temporal_features = spatio_temporal_features.view(B, T, -1)  # [B, T, 512]
         features, attn_w = self.self_attn(spatio_temporal_features)  # [B, T, 512]
-        pooled_features, attn_scores = self.pooler_attn(features)  # [B, 512]
+        # pooled_features, attn_scores = self.pooler_attn(features)  # [B, 512]
+        pooled_features = self.pooler_mean(features)  # [B, 512]
 
         # Apply regressor
         classification_logits = self.classifier(pooled_features)  # [B, C]
@@ -90,9 +112,9 @@ class TemporalAnticipationModel(nn.Module):
 
 def __test__():
 
-
     from datasets.cholec80 import Cholec80Dataset
     from torch.utils.data import DataLoader
+    from losses.weighted_regr_loss import WeightedMSELoss
 
     B, T, C, H, W = 5, 10, 3, 224, 224  # Batch size, sequence length, channels, height, width
     num_classes = 7
@@ -136,7 +158,8 @@ def __test__():
     ce_loss = torch.nn.functional.cross_entropy(classification_logits, current_targets)
     r_loss = torch.nn.functional.mse_loss(regression_logits, regression_targets)
 
-    loss = ce_loss + r_loss
+    # loss = ce_loss + r_loss
+    loss = WeightedMSELoss()(regression_logits, regression_targets)
 
     print("Loss:", loss.item())
     print("Classification logits:", classification_logits)

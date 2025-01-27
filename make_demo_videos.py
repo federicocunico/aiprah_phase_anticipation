@@ -8,18 +8,19 @@ from moviepy import ImageSequenceClip
 from tqdm import tqdm
 
 data = pickle.load(open("demo_output.pickle", "rb"))
+TARGET = "video02"
+video_data = data[TARGET]
+subsampling = 30
+video_data = video_data[::subsampling]  # every 30th frame, sequence length is 30
 
-video_data = data["video01"]
-video_data = video_data[::30]  # every 30th frame, sequence length is 30
-
-x = np.arange(0, len(video_data) * 30)
+x = np.arange(0, len(video_data) * subsampling)
 
 frames = []
 pred_anticipated_phase = []
 gt_anticipated_phase = []
 
 for i, d in enumerate(video_data):
-    for j in range(30):
+    for j in range(subsampling):
         # pred_anticip = d["pred_anticipated_phase"][j]
         # gauss noise 7x1
         gauss_noise = np.random.normal(0, 0.5, 7)
@@ -95,12 +96,12 @@ for j in range(len(axes)):
 frames_movie = []
 for i in tqdm(range(len(frames))):
 
-    frame_name = frames[i].split("/")[-1]
-    frame_name = os.path.join("video01", frame_name)
-    assert os.path.exists(frame_name), f"{frame_name} does not exist"
+    # frame_name = frames[i].split("/")[-1]
+    # frame_name = os.path.join(TARGET, frame_name)
+    # assert os.path.exists(frame_name), f"{frame_name} does not exist"
 
-    image = cv2.imread(frame_name, cv2.IMREAD_COLOR)
-    frames_movie.append(image)
+    # image = cv2.imread(frame_name, cv2.IMREAD_COLOR)
+    # frames_movie.append(image)
 
     plt.suptitle(f"Current phase: {get_gt_phase(i)}")
     for j, ph_name in enumerate(cholec80_phases):
@@ -130,9 +131,11 @@ for i in tqdm(range(len(frames))):
     # plt.draw()
     plt.tight_layout()
     # plt.pause(0.1)
-    plt.savefig(f"video01_res/demo_frame_{str(i).zfill(5)}.png")
+    save_fig_fname = f"{TARGET}_res/demo_frame_{str(i).zfill(5)}.png"
+    os.makedirs(os.path.dirname(save_fig_fname), exist_ok=True)
+    plt.savefig(save_fig_fname )
 
-saved_frames = glob.glob("video01_res/demo_frame_*.png")
+saved_frames = glob.glob(f"{TARGET}_res/demo_frame_*.png")
 saved_frames.sort()
 saved_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in saved_frames]
 frames_movie = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_movie]
