@@ -62,7 +62,7 @@ class TemporalResNetLSTM(nn.Module):
     #     return y
 
     def forward(self, x: torch.Tensor):
-        y: torch.Tensor = self.backbone.get_features(x)  # [batch_size*T, 512]
+        y: torch.Tensor = self.backbone.get_spatio_temporal_features(x)  # [batch_size*T, 512]
         # y = y.view(-1, self.sequence_length, 512)  # [batch_size, T, 512]
 
         # query memory bank

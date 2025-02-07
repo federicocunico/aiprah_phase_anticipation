@@ -16,7 +16,7 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         fig, self.ax = plt.subplots(1, 1, figsize=(15, 5))
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=0.01)
         return optimizer
 
     def training_step(self, batch, batch_idx):
@@ -30,12 +30,19 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         time_to_next_phase = torch.clamp(time_to_next_phase, 0, self.model.time_horizon)
 
         outputs = self.model(frames)
-        
+
         if isinstance(outputs, tuple) and len(outputs) == 2:
             current_phase, anticipated_phase = outputs
             loss, loss_phase, loss_anticipation = self.loss_criterion(
                 current_phase, anticipated_phase, labels, time_to_next_phase
             )
+        elif isinstance(outputs, torch.Tensor):
+            regression_logits = outputs
+            regression_logits = regression_logits / self.model.time_horizon  # Normalize to [0, 1]
+            time_to_next_phase = time_to_next_phase / self.model.time_horizon  # Normalize to [0, 1]
+            loss = self.loss_criterion(regression_logits, time_to_next_phase)
+            loss_phase = 0
+            loss_anticipation = loss
         else:
             current_logits, future_logits, regression_logits = outputs
 
@@ -96,6 +103,15 @@ class PhaseAnticipationTrainer(pl.LightningModule):
             loss, loss_phase, loss_anticipation = self.loss_criterion(
                 current_phase, anticipated_phase, labels, time_to_next_phase
             )
+            _, predicted = torch.max(current_phase, 1)
+        elif isinstance(outputs, torch.Tensor):
+            regression_logits = outputs
+            regression_logits = regression_logits / self.model.time_horizon  # Normalize to [0, 1]
+            time_to_next_phase = time_to_next_phase / self.model.time_horizon  # Normalize to [0, 1]
+            loss = self.loss_criterion(regression_logits, time_to_next_phase)
+            loss_phase = 0
+            loss_anticipation = loss
+            predicted = torch.argmin(regression_logits, dim=1)
         else:
             current_phase, future_logits, regression_logits = outputs
 
@@ -108,8 +124,8 @@ class PhaseAnticipationTrainer(pl.LightningModule):
             loss = loss_dict["total_loss"]
             loss_phase = loss_dict["classification_loss"]
             loss_anticipation = loss_dict["regression_loss"]
+            _, predicted = torch.max(current_phase, 1)
 
-        _, predicted = torch.max(current_phase, 1)
         self.val_y_true.extend(labels.detach().cpu().tolist())
         self.val_y_pred.extend(predicted.detach().cpu().tolist())
 

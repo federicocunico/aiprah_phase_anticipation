@@ -66,7 +66,7 @@ def create_memorybank(
                     inputs = inputs.to(device)
                     # labels = labels.to(device)
 
-                    outputs_feature: torch.Tensor = model.get_features(inputs)
+                    outputs_feature: torch.Tensor = model.get_spatio_temporal_features(inputs)
                     # outputs_feature has shape (batch_size*seq_len, 512)
                     # outputs_feature = outputs_feature.detach().cpu().numpy()
 

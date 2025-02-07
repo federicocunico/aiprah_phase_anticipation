@@ -1,10 +1,6 @@
 import torch
 import torch.nn as nn
-from torchvision.models import vit_b_16, ViT_B_16_Weights
-from torchvision.models import resnet50, ResNet50_Weights, resnet18, ResNet18_Weights
-
 from models.membank_model import MemBankResNetLSTM
-from models.non_local import TimeConv
 
 
 class SelfAttention(nn.Module):
@@ -53,6 +49,7 @@ class MeanAttentionPooling(torch.nn.Module):
         refined_features = mean_features * attn_scores
         return refined_features
 
+
 class MaxPooler(nn.Module):
     def __init__(self, input_dim):
         super(MaxPooler, self).__init__()
@@ -65,6 +62,7 @@ class MaxPooler(nn.Module):
         x = self.pooler(x)  # [B, E, 1]
         x = x.squeeze(-1)  # [B, E]
         return x
+
 
 class Identity(nn.Module):
     def forward(self, x):
@@ -85,42 +83,37 @@ class TemporalAnticipationModel(nn.Module):
         self.time_horizon = time_horizon
         # self.future_steps = future_steps  # F
 
-        self.embedding_dim = 512  # output of backbone
+        self.embedding_dim = 2048  # output of backbone
         self.self_attn = SelfAttention(embed_dim=self.embedding_dim, num_heads=2)
         # self.pooler_attn = AttentionPooling(input_dim=self.embedding_dim)
         # self.pooler_mean = MeanAttentionPooling(input_dim=self.embedding_dim)
         self.poolder_max = MaxPooler(1)
 
         self.regressor = torch.nn.Sequential(
-            torch.nn.Linear(self.embedding_dim, 1024),  # First layer
+            torch.nn.Linear(self.embedding_dim, 256),  # First layer
             torch.nn.ReLU(),  # Non-linearity
-            torch.nn.Linear(1024, num_classes),  # Final output layer
-        )
-
-        self.classifier = torch.nn.Sequential(
-            torch.nn.Linear(self.embedding_dim, 1024),  # First layer
-            torch.nn.ReLU(),  # Non-linearity
-            torch.nn.Linear(1024, num_classes),  # Final output layer
+            torch.nn.Linear(256, num_classes),  # Final output layer
         )
 
     def forward(self, x: torch.Tensor):
         B, T, C, H, W = x.size()
 
         # get spatio-temporal features
-        spatio_temporal_features = self.backbone.get_spatio_temporal_features(x)  # [B*T, 512]
-        spatio_temporal_features = spatio_temporal_features.view(B, T, -1)  # [B, T, 512]
-        features, attn_w = self.self_attn(spatio_temporal_features)  # [B, T, 512]
-        # pooled_features, attn_scores = self.pooler_attn(features)  # [B, 512]
-        pooled_features = self.poolder_max(features)  # [B, 512]
+        ## F = 512 or 2048, output of backbone
+        spatio_temporal_features = self.backbone.get_spatial_features(x)  # [B, T, F]
+        # spatio_temporal_features = spatio_temporal_features.view(B, T, -1)  # [B, T, F]
+        features, attn_w = self.self_attn(spatio_temporal_features)  # [B, T, F]
+        # pooled_features, attn_scores = self.pooler_attn(features)  # [B, F]
+        pooled_features = self.poolder_max(features)  # [B, F]
 
         # Apply regressor
-        classification_logits = self.classifier(pooled_features)  # [B, C]
-
         regression_logits = self.regressor(pooled_features)  # [B, C]
         # Clamp regression logits to [0, time_horizon]
         regression_logits_clamped = torch.nn.functional.sigmoid(regression_logits) * self.time_horizon  # [B, C]
 
-        return classification_logits, regression_logits_clamped
+        # classification_logits = regression_logits_clamped / self.time_horizon  # [B, C]
+
+        return regression_logits_clamped
 
 
 def __test__():
@@ -161,21 +154,21 @@ def __test__():
     model = TemporalAnticipationModel(sequence_length=T, num_classes=num_classes, time_horizon=time_horizon)
 
     # Forward pass
-    classification_logits, regression_logits = model(xin)
+    regression_logits = model(xin)
 
     # Compute loss
     current_targets = batch["phase_label"]  # [B]
     future_targets = batch["future_targets"]  # [B, T, F, C]
     regression_targets = batch["time_to_next_phase"]  # [B, C]
 
-    ce_loss = torch.nn.functional.cross_entropy(classification_logits, current_targets)
+    # ce_loss = torch.nn.functional.cross_entropy(classification_logits, current_targets)
     r_loss = torch.nn.functional.mse_loss(regression_logits, regression_targets)
 
     # loss = ce_loss + r_loss
     loss = WeightedMSELoss()(regression_logits, regression_targets)
 
     print("Loss:", loss.item())
-    print("Classification logits:", classification_logits)
+    # print("Classification logits:", classification_logits)
     print("Regression logits:", regression_logits)
 
 
