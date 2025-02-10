@@ -185,10 +185,10 @@ class Cholec80Dataset(Dataset):
             video_idxs = list(range(1, 3))
             self.transform = self.train_transform
         elif self.mode == "demo_val":
-            video_idxs = list(range(3, 5))
+            video_idxs = list(range(46, 48))
             self.transform = self.test_transform
         elif self.mode == "demo_test":
-            video_idxs = list(range(5, 7))
+            video_idxs = list(range(61, 65))
             self.transform = self.test_transform
         # -----------------------------------
 

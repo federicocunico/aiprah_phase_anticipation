@@ -7,8 +7,10 @@ import pickle
 from moviepy import ImageSequenceClip
 from tqdm import tqdm
 
-data = pickle.load(open("demo_output.pickle", "rb"))
-TARGET = "video02"
+data = pickle.load(open("demo_output_val.pickle", "rb"))
+# TARGET = "video02"  # train
+TARGET = "video46" # val
+# TARGET = "video50"  # test
 video_data = data[TARGET]
 subsampling = 30
 video_data = video_data[::subsampling]  # every 30th frame, sequence length is 30
@@ -96,12 +98,12 @@ for j in range(len(axes)):
 frames_movie = []
 for i in tqdm(range(len(frames))):
 
-    # frame_name = frames[i].split("/")[-1]
-    # frame_name = os.path.join(TARGET, frame_name)
-    # assert os.path.exists(frame_name), f"{frame_name} does not exist"
+    frame_name = frames[i].split("/")[-1]
+    frame_name = os.path.join("data/cholec80/downsampled_fps=1", TARGET, frame_name)
+    assert os.path.exists(frame_name), f"{frame_name} does not exist"
 
     # image = cv2.imread(frame_name, cv2.IMREAD_COLOR)
-    # frames_movie.append(image)
+    frames_movie.append(frame_name)
 
     plt.suptitle(f"Current phase: {get_gt_phase(i)}")
     for j, ph_name in enumerate(cholec80_phases):
@@ -137,12 +139,12 @@ for i in tqdm(range(len(frames))):
     os.makedirs(os.path.dirname(save_fig_fname), exist_ok=True)
     plt.savefig(save_fig_fname )
 
-saved_frames = glob.glob(f"{TARGET}_res/demo_frame_*.png")
+saved_frames = glob.glob(f"{TARGET}_res/*.png")
 saved_frames.sort()
 saved_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in saved_frames]
-frames_movie = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_movie]
+# frames_movie = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_movie]
 
 # save video
 
-ImageSequenceClip(frames_movie, fps=30).write_videofile("demo_video_surgery.mp4")
-ImageSequenceClip(saved_frames, fps=30).write_videofile("demo_video_phase.mp4")
+ImageSequenceClip(frames_movie, fps=30).write_videofile(f"demo_video_surgery_{TARGET}.mp4")
+ImageSequenceClip(saved_frames, fps=30).write_videofile(f"demo_video_phase_{TARGET}.mp4")

@@ -16,7 +16,9 @@ def train_model():
     num_classes = 7
     device = torch.device("cuda:0")
 
-    demo_dataset = Cholec80Dataset(root_dir="./data/cholec80", mode="demo_train", seq_len=seq_len, fps=target_fps)
+    target = "val"
+
+    demo_dataset = Cholec80Dataset(root_dir="./data/cholec80", mode=f"demo_{target}", seq_len=seq_len, fps=target_fps)
     # demo_loader = DataLoader(demo_dataset, batch_size=1, shuffle=False)
 
     model = TemporalAnticipationModel(time_horizon=5, sequence_length=seq_len, num_classes=num_classes)
@@ -62,7 +64,7 @@ def train_model():
                 out[metadata['video_name']] = []
             out[metadata['video_name']].append(out_data)
 
-    with open("demo_output.pickle", "wb") as f:
+    with open(f"demo_output_{target}.pickle", "wb") as f:
         pickle.dump(out, f)
 
 if __name__ == "__main__":
