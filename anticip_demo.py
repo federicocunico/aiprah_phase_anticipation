@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, confusion_matrix
 from tqdm import tqdm
 from trainer import PhaseAnticipationTrainer
-from models.temporal_model_v4 import TemporalAnticipationModel
+from models.temporal_model_v5 import TemporalAnticipationModel
 from datasets.cholec80 import Cholec80Dataset
 
 def train_model():
@@ -23,10 +23,11 @@ def train_model():
     pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=None)
 
     # load pretrained-checkpoint
-    final_model = "./cholec80/1fw3qjzl/checkpoints/stage2_model_best.ckpt"
+    final_model = "checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt"
     pl_model.load_state_dict(torch.load(final_model, weights_only=True)["state_dict"])
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    dtype = torch.float32
     model = model.to(device=device, dtype=dtype)
 
     # init model
@@ -40,14 +41,20 @@ def train_model():
             frames = frames.to(device=device, dtype=dtype).unsqueeze(0)
             # metadata = {k: v.to(device=device, dtype=dtype) for k, v in metadata.items()}
             start = time.time()
-            current_phase, anticipated_phase = model(frames)
+            model_output = model(frames)
+            if isinstance(out, tuple):
+                current_phase, anticipated_phase = model_output
+            else:
+                anticipated_phase = model_output
+                current_phase = torch.argmin(anticipated_phase, dim=1)
+
             fps = 1 / (time.time() - start)
             # print(f"FPS: {fps:.2f}")
 
             metadata["time_to_next_phase_dense"] = torch.clamp(metadata["time_to_next_phase_dense"], 0, model.time_horizon)
             m = {k: v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
             out_data = {
-                "pred_current_phase": current_phase.cpu().float().numpy().tolist(),
+                "pred_current_phase": current_phase.cpu().numpy().tolist(),
                 "pred_anticipated_phase": anticipated_phase.cpu().float().numpy().tolist(),
                 **m,
             }

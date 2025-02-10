@@ -15,6 +15,8 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         # self.ax = plt.subplot(111)  # Create a subplot for timings
         fig, self.ax = plt.subplots(1, 1, figsize=(15, 5))
 
+        self.min_loss = float("inf")
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=0.01)
         return optimizer
@@ -75,6 +77,11 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         )
         self.log("val_acc", acc)
         self.log("val_anticip", mse_loss)
+
+        if mse_loss < self.min_loss:
+            self.min_loss = mse_loss
+            # self.save_checkpoint("best")
+            torch.save(self.model.state_dict(), "best.pth")
 
         self.ax.cla()
         self.ax.set_ylabel("Time to next phase (cap 5)")

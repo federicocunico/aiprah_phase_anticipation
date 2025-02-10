@@ -30,8 +30,8 @@ from memory_bank_utils import create_memorybank, get_long_range_feature_clip, ge
 def train_model():
     seed_everything(0)
 
-    log_dir = "logs"
-    wandb_logger = WandbLogger(name="stage2", project="cholec80", dir=log_dir)
+    log_dir = "checkpoints"
+    wandb_logger = WandbLogger(name="stage2", project="cholec80")
     # -------------------
     # Hyperparameters
     # -------------------
@@ -86,7 +86,7 @@ def train_model():
     pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=loss_criterion)
 
     ckpt_save = ModelCheckpoint(
-        dirpath=f"{log_dir}/checkpoints",
+        dirpath=f"{log_dir}",
         filename="e={epoch}-l={val_loss_anticipation}-stage2_model_best",
         monitor="val_loss_anticipation",
         mode="min",

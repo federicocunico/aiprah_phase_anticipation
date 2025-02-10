@@ -123,8 +123,10 @@ for i in tqdm(range(len(frames))):
             len(xx) == len(pred_val) == len(gt_val)
         ), f"len(xx)={len(xx)}, len(pred_val)={len(pred_val)}, len(gt_val)={len(gt_val)}"
 
-        ax.plot(xx, gt_val, label="gt", color="red")
-        # ax.plot(xx, pred_val, label="pred", color="blue")
+        ax.plot(xx, pred_val, label="pred", color="red")
+        ax.plot(xx, gt_val, label="gt", color="blue")
+
+        ax.legend()
 
         set_layout(ax)
 
