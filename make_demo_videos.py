@@ -1,6 +1,8 @@
 import glob
 import os
+import shutil
 import cv2
+from joblib import Parallel, delayed
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
@@ -9,51 +11,62 @@ from tqdm import tqdm
 
 data = pickle.load(open("demo_output_val.pickle", "rb"))
 # TARGET = "video02"  # train
-TARGET = "video46" # val
+TARGET = "video46"  # val
 # TARGET = "video50"  # test
 video_data = data[TARGET]
-subsampling = 30
-video_data = video_data[::subsampling]  # every 30th frame, sequence length is 30
 
-x = np.arange(0, len(video_data) * subsampling)
+x = np.arange(0, len(video_data))
 
 frames = []
 pred_anticipated_phase = []
 gt_anticipated_phase = []
 
 for i, d in enumerate(video_data):
-    for j in range(subsampling):
-        # pred_anticip = d["pred_anticipated_phase"][j]
-        # gauss noise 7x1
-        gauss_noise = np.random.normal(0, 0.5, 7)
-        # pred_anticip = np.asarray(d["time_to_next_phase"]) + gauss_noise
-        # pred_anticip[pred_anticip < 0] = abs(pred_anticip[pred_anticip < 0])
-        gt_anticip = np.asarray(d["time_to_next_phase_dense"])[:, 0]
-        pred_anticip = gt_anticip + gauss_noise
-        # S = 10
-        # r = np.roll(pred_anticip, S)
-        # r[:S] = 0
-        # pred_anticip = pred_anticip + r
+    pred_anticip = np.asarray(d["pred_anticipated_phase"]).squeeze()
+    # gauss noise 7x1
+    # gauss_noise = np.random.normal(0, 0.5, 7)
+    # pred_anticip = np.asarray(d["time_to_next_phase"]) + gauss_noise
+    # pred_anticip[pred_anticip < 0] = abs(pred_anticip[pred_anticip < 0])
+    gt_anticip = np.asarray(d["time_to_next_phase_dense"])[:, 0]
+    # pred_anticip = gt_anticip + gauss_noise
+    # S = 10
+    # r = np.roll(pred_anticip, S)
+    # r[:S] = 0
+    # pred_anticip = pred_anticip + r
 
-        # clamp to 5
-        pred_anticip[pred_anticip > 5] = 5
-        pred_anticip[pred_anticip < 0] = 0
-        gt_anticip[gt_anticip > 5] = 5
-        gt_anticip[gt_anticip < 0] = 0
+    # clamp to 5
+    pred_anticip[pred_anticip > 5] = 5
+    pred_anticip[pred_anticip < 0] = 0
+    gt_anticip[gt_anticip > 5] = 5
+    gt_anticip[gt_anticip < 0] = 0
 
-        tmp = {
-            "frame": d["frames_filepath"][j],
-            # "pred_current_phase": pred_anticip,
-            "gt_current_phase": d["phase_label"],
-            "pred_anticipated_phase": pred_anticip.tolist(),
-            "gt_anticipated_phase": gt_anticip.tolist(),
-        }
-        # linear_data.append(tmp)
-        frames.append(tmp["frame"])
-        # pred_anticipated_phase.append(tmp["pred_current_phase"])
-        # gt_current_phase.append(tmp["gt_current_phase"])
-        pred_anticipated_phase.append(tmp["pred_anticipated_phase"])
-        gt_anticipated_phase.append(tmp["gt_anticipated_phase"])
+    seq_len = len(d["frames_filepath"])
+    # for j in range(seq_len):
+    #     tmp = {
+    #         "frame": d["frames_filepath"][j],
+    #         "gt_current_phase": d["phase_label"],
+    #         "pred_anticipated_phase": pred_anticip.tolist(),
+    #         "gt_anticipated_phase": gt_anticip.tolist(),
+    #     }
+    #     # linear_data.append(tmp)
+    #     frames.append(tmp["frame"])
+    #     # pred_anticipated_phase.append(tmp["pred_current_phase"])
+    #     # gt_current_phase.append(tmp["gt_current_phase"])
+    #     pred_anticipated_phase.append(tmp["pred_anticipated_phase"])
+    #     gt_anticipated_phase.append(tmp["gt_anticipated_phase"])
+    j = seq_len - 1
+    tmp = {
+        "frame": d["frames_filepath"][j],
+        "gt_current_phase": d["phase_label"],
+        "pred_anticipated_phase": pred_anticip.tolist(),
+        "gt_anticipated_phase": gt_anticip.tolist(),
+    }
+    # linear_data.append(tmp)
+    frames.append(tmp["frame"])
+    # pred_anticipated_phase.append(tmp["pred_current_phase"])
+    # gt_current_phase.append(tmp["gt_current_phase"])
+    pred_anticipated_phase.append(tmp["pred_anticipated_phase"])
+    gt_anticipated_phase.append(tmp["gt_anticipated_phase"])
 
 pred_anticipated_phase = np.asarray(pred_anticipated_phase)
 gt_anticipated_phase = np.asarray(gt_anticipated_phase)
@@ -80,6 +93,8 @@ def set_layout(ax):
     # ax.grid()
     ax.grid("off")
     # ax.legend()
+    ax.set_xlabel("time (frames)")
+    ax.set_ylabel("time (m)")
 
 
 def get_gt_phase(i):
@@ -94,10 +109,16 @@ for j in range(len(axes)):
     set_layout(axes[j])
 
 # plt.tight_layout()
+template = f"{TARGET}_res/demo_frame_{{0}}.png"
+folder = os.path.dirname(template)
+if os.path.isdir(folder):
+    shutil.rmtree(folder)
+os.makedirs(folder, exist_ok=True)
 
 frames_movie = []
-for i in tqdm(range(len(frames))):
 
+
+def make_seq(i):
     frame_name = frames[i].split("/")[-1]
     frame_name = os.path.join("data/cholec80/downsampled_fps=1", TARGET, frame_name)
     assert os.path.exists(frame_name), f"{frame_name} does not exist"
@@ -105,7 +126,7 @@ for i in tqdm(range(len(frames))):
     # image = cv2.imread(frame_name, cv2.IMREAD_COLOR)
     frames_movie.append(frame_name)
 
-    plt.suptitle(f"Current phase: {get_gt_phase(i)}")
+    plt.suptitle(f"Current phase: {get_gt_phase(i)} (red: pred, blue: gt)")
     for j, ph_name in enumerate(cholec80_phases):
         ax = axes[j]
         ax.cla()
@@ -128,23 +149,31 @@ for i in tqdm(range(len(frames))):
         ax.plot(xx, pred_val, label="pred", color="red")
         ax.plot(xx, gt_val, label="gt", color="blue")
 
-        ax.legend()
+        # ax.legend()
 
         set_layout(ax)
 
     # plt.draw()
     plt.tight_layout()
     # plt.pause(0.1)
-    save_fig_fname = f"{TARGET}_res/demo_frame_{str(i).zfill(5)}.png"
-    os.makedirs(os.path.dirname(save_fig_fname), exist_ok=True)
-    plt.savefig(save_fig_fname )
+    save_fig_fname = template.format(str(i).zfill(5))
+    # os.makedirs(os.path.dirname(save_fig_fname), exist_ok=True)
+    plt.savefig(save_fig_fname)
+
+
+parallel = False
+
+if not parallel:
+    # not parallel
+    for i in tqdm(range(len(frames))):
+        make_seq(i)
+else:
+    # do in parallel with joblib
+    Parallel(n_jobs=8)(delayed(make_seq)(i) for i in range(len(frames)))
 
 saved_frames = glob.glob(f"{TARGET}_res/*.png")
 saved_frames.sort()
 saved_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in saved_frames]
-# frames_movie = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_movie]
-
 # save video
-
-ImageSequenceClip(frames_movie, fps=30).write_videofile(f"demo_video_surgery_{TARGET}.mp4")
-ImageSequenceClip(saved_frames, fps=30).write_videofile(f"demo_video_phase_{TARGET}.mp4")
+ImageSequenceClip(frames_movie, fps=30).write_videofile(f"{TARGET}_surgery_RGB.mp4")
+ImageSequenceClip(saved_frames, fps=30).write_videofile(f"{TARGET}_phase_plot.mp4")
