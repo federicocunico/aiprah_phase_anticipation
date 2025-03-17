@@ -19,15 +19,75 @@ from datasets.cholec80 import Cholec80Dataset
 import numpy as np
 
 
-def eval_model():
+def aggregate_predictions(out, aggregator_window_size=5):
+    """
+    Aggregate predictions in non-overlapping windows.
+
+    For each video, the number of aggregated samples is
+        len(out[video_name]) // aggregator_window_size.
+
+    For predictions:
+      - Phase segmentation: majority vote.
+      - Phase anticipation: element-wise mean.
+
+    Ground truth values are subsampled from the center sample of each window.
+
+    Parameters:
+        out: dict mapping video names to lists of prediction dictionaries.
+             Each dictionary must contain:
+               - "pred_current_phase": int prediction.
+               - "pred_anticipated_phase": list of floats.
+               - "gt_current_phase": ground truth int.
+               - "gt_anticipated_phase": ground truth list of floats.
+               - Optionally, "frame_index": frame/time index.
+        aggregator_window_size: size of the non-overlapping window.
+
+    Returns:
+        aggregated: dict with the same structure as `out` but with reduced length,
+                    where for each video:
+                        len(aggregated[video]) = len(out[video]) // aggregator_window_size.
+    """
+    aggregated = {}
+    for video, predictions in out.items():
+        # Sort by frame index if available.
+        if "frame_index" in predictions[0]:
+            predictions = sorted(predictions, key=lambda x: x["frame_index"])
+        agg_video = []
+        n = len(predictions)
+        # Iterate with a step equal to aggregator_window_size.
+        for i in range(0, n - aggregator_window_size + 1, aggregator_window_size):
+            window = predictions[i : i + aggregator_window_size]
+            # Aggregate predictions:
+            seg_votes = [pred["pred_current_phase"] for pred in window]
+            majority = int(np.bincount(seg_votes).argmax())
+            anticipated_array = np.array([pred["pred_anticipated_phase"] for pred in window])
+            mean_anticipated = anticipated_array.mean(axis=0).tolist()
+            # Subsample GT values from the center sample.
+            center = aggregator_window_size // 2
+            frame_index = window[center].get("frame_index", i + center)
+            gt_current_phase = window[center]["gt_current_phase"]
+            gt_anticipated_phase = window[center]["gt_anticipated_phase"]
+            agg_video.append(
+                {
+                    "frame_index": frame_index,
+                    "pred_current_phase": majority,
+                    "pred_anticipated_phase": mean_anticipated,
+                    "gt_current_phase": gt_current_phase,
+                    "gt_anticipated_phase": gt_anticipated_phase,
+                }
+            )
+        aggregated[video] = agg_video
+    return aggregated
+
+
+def eval_model(split: str):
     torch.set_float32_matmul_precision("high")  # 'high' or 'medium'; for RTX GPUs
     seq_len = 30
     target_fps = 1
     num_classes = 7
     device = torch.device("cuda:0")
 
-    split = "val"
-    fname = f"eval_split={split}.pickle"
+    fname = f"results/eval_split={split}.pickle"
 
     model = TemporalAnticipationModel(time_horizon=5, sequence_length=seq_len, num_classes=num_classes)
     # If evaluation output does not exist, run the model on the dataset and save outputs.
@@ -35,16 +95,16 @@ def eval_model():
         dataset = Cholec80Dataset(root_dir="./data/cholec80", mode=split, seq_len=seq_len, fps=target_fps)
         pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=None)
 
-        # load pretrained-checkpoint
+        # Load pretrained-checkpoint.
         final_model = "checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt"
         pl_model.load_state_dict(torch.load(final_model, weights_only=True)["state_dict"])
 
-        # Set appropriate dtype
+        # Set appropriate dtype.
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
         dtype = torch.float32
         model = model.to(device=device, dtype=dtype)
 
-        # Initialize model (dummy forward pass)
+        # Dummy forward pass to initialize the model.
         model(torch.randn(1, seq_len, 3, 224, 224).to(device=device, dtype=dtype))
 
         out = {}
@@ -54,58 +114,59 @@ def eval_model():
                 frames = frames.to(device=device, dtype=dtype).unsqueeze(0)
                 start = time.time()
                 model_output = model(frames)
-                # Depending on model output format, separate current and anticipated phase predictions
+                # Separate outputs depending on the model's output format.
                 if isinstance(model_output, tuple):
                     current_phase, anticipated_phase = model_output
                 else:
                     anticipated_phase = model_output
                     current_phase = torch.argmin(anticipated_phase, dim=1)
 
-                # For reporting FPS if needed
+                # Calculate FPS if needed.
                 fps = 1 / (time.time() - start)
-                # Convert metadata tensors to CPU lists
+                # Convert metadata tensors to CPU lists.
                 m = {k: v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
+                # Ensure a frame index is available (fall back to the iteration index if not provided).
+                frame_index = m.get("frame_index", i)
                 out_data = {
+                    "frame_index": frame_index,
                     "pred_current_phase": current_phase.cpu().numpy().tolist()[0],  # int
-                    "pred_anticipated_phase": anticipated_phase.cpu()  #
+                    "pred_anticipated_phase": anticipated_phase.cpu()
                     .float()
                     .numpy()
-                    .tolist()[0],  # predicted countdown (list of floats, of length=num_classes)
+                    .tolist()[0],  # list of floats, length=num_classes
                     "gt_anticipated_phase": torch.clamp(metadata["time_to_next_phase"], 0, model.time_horizon)
                     .cpu()
                     .numpy()
-                    .tolist(),  # ground truth (list of floats, of length=num_classes)
-                    "gt_current_phase": metadata["phase_label"].cpu().numpy().tolist(),  # int
+                    .tolist(),  # list of floats
+                    "gt_current_phase": metadata["phase_label"].cpu().numpy().tolist(),  # int or list with one element
                     **m,
                 }
-                video_name = metadata["video_name"]
+                video_name = m["video_name"]
                 if video_name not in out:
                     out[video_name] = []
                 out[video_name].append(out_data)
 
+        # Save the raw window-level predictions.
         with open(fname, "wb") as f:
             pickle.dump(out, f)
     else:
         with open(fname, "rb") as f:
             out = pickle.load(f)
 
+    # Aggregate predictions (and subsample GT accordingly) using a sliding window of size 5.
+    aggregated_out = aggregate_predictions(out, aggregator_window_size=5)
 
-    
-    
-   
-
-
-    # -------------------------------
-    # Evaluation Metrics Computation
-    # -------------------------------
+    # ---------------------------------------------------
+    # Evaluation Metrics Computation on Aggregated Output
+    # ---------------------------------------------------
 
     # 1. Phase Classification Metrics
     phase_preds = []
     phase_gts = []
-    for video, samples in out.items():
+    for video, samples in aggregated_out.items():
         for sample in samples:
             phase_preds.append(sample["pred_current_phase"])
-            # Ensure gt_current_phase is an integer (if it's in a list, take the first element)
+            # Extract ground truth phase as a scalar.
             gt_phase = sample["gt_current_phase"]
             if isinstance(gt_phase, list):
                 gt_phase = gt_phase[0]
@@ -126,24 +187,22 @@ def eval_model():
     for cls, metrics in class_report.items():
         print(f"{cls}: {metrics}")
 
-    # Plot confusion matrix
+    # Plot and save confusion matrix.
     plt.figure(figsize=(6, 5))
-    plt.imshow(conf_mat)
+    plt.imshow(conf_mat, interpolation="nearest")
     plt.title("Confusion Matrix")
     plt.xlabel("Predicted Label")
     plt.ylabel("True Label")
     plt.colorbar()
     plt.xticks(range(num_classes))
     plt.yticks(range(num_classes))
-    plt.savefig(f"cholec80_{split}_confusion_matrix.png")
+    plt.savefig(f"results/cholec80_{split}_confusion_matrix.png")
     plt.close()
 
     # 2. Anticipation Error Metrics (inMAE, oMAE, wMAE, eMAE)
-    # Here we assume that the anticipated phase prediction is a countdown time (in minutes)
-    # and that both pred and gt are lists (we take the first element if they are lists).
     time_preds = []
     time_gts = []
-    for video, samples in out.items():
+    for video, samples in aggregated_out.items():
         for sample in samples:
             gt_time = sample["gt_anticipated_phase"]
             pred_time = sample["pred_anticipated_phase"]
@@ -158,25 +217,18 @@ def eval_model():
     time_preds = np.array(time_preds)
     time_gts = np.array(time_gts)
     abs_errors = np.abs(time_preds - time_gts)
-    h = model.time_horizon  # The time horizon used in the model, e.g., 5 minutes
+    h = model.time_horizon  # e.g., 5 minutes
 
-    # inMAE: errors for samples where the ground truth event is within the horizon (< h)
     in_indices = time_gts < h
     in_errors = abs_errors[in_indices] if np.any(in_indices) else np.array([])
     inMAE = np.mean(in_errors) if in_errors.size > 0 else 0
 
-    # oMAE: errors for samples where the ground truth event equals the horizon (i.e., out-of-horizon events)
     out_indices = time_gts == h
-    # For out-of-horizon events, the expected prediction is h (i.e., the model should predict h)
     out_errors = np.abs(time_preds[out_indices] - h) if np.any(out_indices) else np.array([])
     oMAE = np.mean(out_errors) if out_errors.size > 0 else 0
 
-    wMAE = (inMAE + oMAE) / 2  # as per the paper's definition
+    wMAE = (inMAE + oMAE) / 2
 
-    # eMAE: errors for samples where the ground truth event is within 0.1h (very-short-term prediction)
-
-    # eMAE stands for “very-short-term Mean Absolute Error.” It specifically measures the average absolute error for predictions of events that are expected to occur imminently—typically within a very short fraction (e.g., 10%) of the overall time horizon set for anticipation.
-    # For example, if the model’s time horizon is 5 minutes, eMAE focuses on evaluating the error for events predicted to happen within the first 0.5 minutes (30 seconds). This metric is crucial in scenarios like robotic-assisted surgery, where accurately predicting imminent events is essential for timely interventions and adjustments. A lower eMAE indicates that the model is very effective at making rapid, short-term predictions, which is important for real-time decision-making during surgical procedures.
     e_indices = time_gts < (0.1 * h)
     e_errors = abs_errors[e_indices] if np.any(e_indices) else np.array([])
     eMAE = np.mean(e_errors) if e_errors.size > 0 else 0
@@ -187,12 +239,8 @@ def eval_model():
     print(f"wMAE (weighted MAE): {wMAE:.4f}")
     print(f"eMAE (very-short-term MAE): {eMAE:.4f}")
 
-    # 3. RSD Evaluation (Remaining Surgical Duration)
-    # Since this evaluation is specific to RSD anticipation and the Cholec80 dataset is used for phase anticipation,
-    # we do not compute RSD metrics here. For RSD evaluation, you would typically use the Cataract101 dataset.
-    # print("\nRSD evaluation is not applicable for the Cholec80 (phase anticipation) dataset.")
-
-    with open(f"results_cholec80_split={split}.txt", "w") as fp:
+    # Save evaluation results to a text file.
+    with open(f"results/results_cholec80_split={split}.txt", "w") as fp:
         fp.write("Phase Classification Evaluation:\n")
         fp.write(f"Accuracy: {accuracy:.4f}\n")
         fp.write(f"Precision: {precision:.4f}\n")
@@ -211,4 +259,5 @@ def eval_model():
 
 
 if __name__ == "__main__":
-    eval_model()
+    eval_model("test")
+    eval_model("val")
