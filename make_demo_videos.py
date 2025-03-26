@@ -6,7 +6,8 @@ from joblib import Parallel, delayed
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
-from moviepy import ImageSequenceClip
+from moviepy import ImageSequenceClip, VideoFileClip, clips_array
+from moviepy.video.fx import Resize
 from tqdm import tqdm
 
 data = pickle.load(open("demo_output_val.pickle", "rb"))
@@ -86,7 +87,7 @@ cholec80_phases = [
 ]
 
 
-def set_layout(ax):
+def set_layout(ax, ph_name):
     ax.set_title(ph_name)
     ax.set_xlim(0, len(frames))
     ax.set_ylim(-1, 6)
@@ -106,7 +107,7 @@ def get_gt_phase(i):
 
 for j in range(len(axes)):
     ph_name = cholec80_phases[j]
-    set_layout(axes[j])
+    set_layout(axes[j], ph_name=ph_name)
 
 # plt.tight_layout()
 template = f"{TARGET}_res/demo_frame_{{0}}.png"
@@ -151,7 +152,7 @@ def make_seq(i):
 
         # ax.legend()
 
-        set_layout(ax)
+        set_layout(ax, ph_name)
 
     # plt.draw()
     plt.tight_layout()
@@ -161,19 +162,45 @@ def make_seq(i):
     plt.savefig(save_fig_fname)
 
 
-parallel = False
+FPS = 15
+target_video_rgb = f"{TARGET}_FPS={FPS}_surgery_RGB.mp4"
+target_video_phases = f"{TARGET}_FPS={FPS}_phase_plot.mp4"
+target_video_final = f"{TARGET}_FPS={FPS}_combined.mp4"
 
-if not parallel:
-    # not parallel
-    for i in tqdm(range(len(frames))):
-        make_seq(i)
-else:
-    # do in parallel with joblib
-    Parallel(n_jobs=8)(delayed(make_seq)(i) for i in range(len(frames)))
+if not os.path.isfile(target_video_rgb) or not os.path.isfile(target_video_phases):
+    parallel = False
 
-saved_frames = glob.glob(f"{TARGET}_res/*.png")
-saved_frames.sort()
-saved_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in saved_frames]
-# save video
-ImageSequenceClip(frames_movie, fps=30).write_videofile(f"{TARGET}_surgery_RGB.mp4")
-ImageSequenceClip(saved_frames, fps=30).write_videofile(f"{TARGET}_phase_plot.mp4")
+    if not parallel:
+        # not parallel
+        for i in tqdm(range(len(frames))):
+            make_seq(i)
+    else:
+        # do in parallel with joblib
+        Parallel(n_jobs=8)(delayed(make_seq)(i) for i in range(len(frames)))
+
+    saved_frames = glob.glob(f"{TARGET}_res/*.png")
+    saved_frames.sort()
+    saved_frames = [
+        cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in saved_frames
+    ]
+    # save video
+    ImageSequenceClip(frames_movie, fps=FPS).write_videofile(target_video_rgb)
+    ImageSequenceClip(saved_frames, fps=FPS).write_videofile(target_video_phases)
+
+
+def combine_videos_side_by_side(video1, video2, output):
+    clip1 = VideoFileClip(video1)
+    clip2 = VideoFileClip(video2)
+
+    # Optional: If the clips have different heights, resize one of them:
+    if clip1.h < clip2.h:
+        clip1 = clip1.with_effects([Resize(height=clip2.h)])
+    elif clip2.h < clip1.h:
+        clip2 = clip2.with_effects([Resize(height=clip1.h)])
+
+    # Arrange the two clips side by side in one row
+    final_clip = clips_array([[clip1, clip2]])
+    final_clip.write_videofile(output)
+
+
+combine_videos_side_by_side(target_video_rgb, target_video_phases, target_video_final)
