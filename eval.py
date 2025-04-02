@@ -60,7 +60,9 @@ def aggregate_predictions(out, aggregator_window_size=5):
             # Aggregate predictions:
             seg_votes = [pred["pred_current_phase"] for pred in window]
             majority = int(np.bincount(seg_votes).argmax())
-            anticipated_array = np.array([pred["pred_anticipated_phase"] for pred in window])
+            anticipated_array = np.array(
+                [pred["pred_anticipated_phase"] for pred in window]
+            )
             mean_anticipated = anticipated_array.mean(axis=0).tolist()
             # Subsample GT values from the center sample.
             center = aggregator_window_size // 2
@@ -80,24 +82,30 @@ def aggregate_predictions(out, aggregator_window_size=5):
     return aggregated
 
 
-def eval_model(split: str):
+def eval_model(split: str, horizon: int, final_model: str):
     torch.set_float32_matmul_precision("high")  # 'high' or 'medium'; for RTX GPUs
     seq_len = 30
     target_fps = 1
     num_classes = 7
     device = torch.device("cuda:0")
 
-    fname = f"results/eval_split={split}.pickle"
+    fname = f"results/eval_split={split}_horizon={horizon}.pickle"
 
-    model = TemporalAnticipationModel(time_horizon=5, sequence_length=seq_len, num_classes=num_classes)
+    model = TemporalAnticipationModel(
+        time_horizon=horizon, sequence_length=seq_len, num_classes=num_classes
+    )
     # If evaluation output does not exist, run the model on the dataset and save outputs.
     if not os.path.exists(fname):
-        dataset = Cholec80Dataset(root_dir="./data/cholec80", mode=split, seq_len=seq_len, fps=target_fps)
+        dataset = Cholec80Dataset(
+            root_dir="./data/cholec80", mode=split, seq_len=seq_len, fps=target_fps
+        )
         pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=None)
 
         # Load pretrained-checkpoint.
-        final_model = "checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt"
-        pl_model.load_state_dict(torch.load(final_model, weights_only=True)["state_dict"])
+        # final_model = "checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt"
+        pl_model.load_state_dict(
+            torch.load(final_model, weights_only=True)["state_dict"]
+        )
 
         # Set appropriate dtype.
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
@@ -124,21 +132,31 @@ def eval_model(split: str):
                 # Calculate FPS if needed.
                 fps = 1 / (time.time() - start)
                 # Convert metadata tensors to CPU lists.
-                m = {k: v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
+                m = {
+                    k: v.cpu().numpy().tolist() if isinstance(v, torch.Tensor) else v
+                    for k, v in metadata.items()
+                }
                 # Ensure a frame index is available (fall back to the iteration index if not provided).
                 frame_index = m.get("frame_index", i)
                 out_data = {
                     "frame_index": frame_index,
-                    "pred_current_phase": current_phase.cpu().numpy().tolist()[0],  # int
+                    "pred_current_phase": current_phase.cpu()
+                    .numpy()
+                    .tolist()[0],  # int
                     "pred_anticipated_phase": anticipated_phase.cpu()
                     .float()
                     .numpy()
                     .tolist()[0],  # list of floats, length=num_classes
-                    "gt_anticipated_phase": torch.clamp(metadata["time_to_next_phase"], 0, model.time_horizon)
+                    "gt_anticipated_phase": torch.clamp(
+                        metadata["time_to_next_phase"], 0, model.time_horizon
+                    )
                     .cpu()
                     .numpy()
                     .tolist(),  # list of floats
-                    "gt_current_phase": metadata["phase_label"].cpu().numpy().tolist(),  # int or list with one element
+                    "gt_current_phase": metadata["phase_label"]
+                    .cpu()
+                    .numpy()
+                    .tolist(),  # int or list with one element
                     **m,
                 }
                 video_name = m["video_name"]
@@ -196,7 +214,7 @@ def eval_model(split: str):
     plt.colorbar()
     plt.xticks(range(num_classes))
     plt.yticks(range(num_classes))
-    plt.savefig(f"results/cholec80_{split}_confusion_matrix.png")
+    plt.savefig(f"results/cholec80_{split}_confusion_matrix_horizon={horizon}.png")
     plt.close()
 
     # 2. Anticipation Error Metrics (inMAE, oMAE, wMAE, eMAE)
@@ -224,7 +242,9 @@ def eval_model(split: str):
     inMAE = np.mean(in_errors) if in_errors.size > 0 else 0
 
     out_indices = time_gts == h
-    out_errors = np.abs(time_preds[out_indices] - h) if np.any(out_indices) else np.array([])
+    out_errors = (
+        np.abs(time_preds[out_indices] - h) if np.any(out_indices) else np.array([])
+    )
     oMAE = np.mean(out_errors) if out_errors.size > 0 else 0
 
     wMAE = (inMAE + oMAE) / 2
@@ -240,7 +260,7 @@ def eval_model(split: str):
     print(f"eMAE (very-short-term MAE): {eMAE:.4f}")
 
     # Save evaluation results to a text file.
-    with open(f"results/results_cholec80_split={split}.txt", "w") as fp:
+    with open(f"results/results_cholec80_split={split}_horizon={horizon}.txt", "w") as fp:
         fp.write("Phase Classification Evaluation:\n")
         fp.write(f"Accuracy: {accuracy:.4f}\n")
         fp.write(f"Precision: {precision:.4f}\n")
@@ -259,5 +279,13 @@ def eval_model(split: str):
 
 
 if __name__ == "__main__":
-    eval_model("test")
-    eval_model("val")
+    eval_model(
+        "test",
+        horizon=5,
+        final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
+    )
+    eval_model(
+        "val",
+        horizon=5,
+        final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
+    )

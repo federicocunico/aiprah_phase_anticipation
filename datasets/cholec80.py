@@ -300,7 +300,7 @@ class Cholec80Dataset(Dataset):
         NUM_PHASES = 7
         dst = os.path.join(self.root_dir, f"phase_transition_{self.mode}.pkl")
         if os.path.isfile(dst):
-            return torch.load(dst, weights_only=False)
+            phase_results = torch.load(dst, weights_only=False)
         else:
             phase_results = {}
 
@@ -409,6 +409,7 @@ def create_future_classification_targets(all_ph_trans_time, seq_len: int, F: int
 
 def __test__():
     data_dir = "./data/cholec80"
+    dataset = Cholec80Dataset(data_dir, mode="train", seq_len=10, fps=1)
     dataset = Cholec80Dataset(data_dir, mode="val", seq_len=10, fps=1)
 
     print(f"Number of videos: {len(dataset)}")

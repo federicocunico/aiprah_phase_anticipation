@@ -75,8 +75,9 @@ class TemporalAnticipationModel(nn.Module):
 
         # Lightweight ResNet-18 backbone
         self.backbone = MemBankResNetLSTM(num_classes=num_classes, sequence_length=sequence_length)
-        # load pretrained model
-        self.backbone.load_state_dict(torch.load("./wandb/run-stage1/checkpoints/membank_best.pth", weights_only=True))
+        if num_classes == 7:
+            # load pretrained model
+            self.backbone.load_state_dict(torch.load("checkpoints/cholec80-run-stage1/checkpoints/membank_best.pth", weights_only=True))
 
         self.sequence_length = sequence_length
         self.num_classes = num_classes
