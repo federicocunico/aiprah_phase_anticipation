@@ -279,6 +279,7 @@ def eval_model(split: str, horizon: int, final_model: str):
 
 
 if __name__ == "__main__":
+    ## HORIZON = 5
     eval_model(
         "test",
         horizon=5,
@@ -288,4 +289,26 @@ if __name__ == "__main__":
         "val",
         horizon=5,
         final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
+    )
+    ## HORIZON = 3
+    eval_model(
+        "test",
+        horizon=3,
+        final_model="checkpoints/stage2_horizon=3/e=epoch=47-l=val_loss_anticipation=0.023974817246198654-val_acc=val_acc=0.8197687864303589_horizon=3-stage2_model_best.ckpt",
+    )
+    eval_model(
+        "val",
+        horizon=3,
+        final_model="checkpoints/stage2_horizon=3/e=epoch=47-l=val_loss_anticipation=0.023974817246198654-val_acc=val_acc=0.8197687864303589_horizon=3-stage2_model_best.ckpt",
+    )
+    ## HORIZON = 1
+    eval_model(
+        "test",
+        horizon=1,
+        final_model="checkpoints/stage2_horizon=1/e=epoch=12-l=val_loss_anticipation=0.022330984473228455-val_acc=val_acc=0.829586386680603horizon=1-stage2_model_best.ckpt",
+    )
+    eval_model(
+        "val",
+        horizon=1,
+        final_model="checkpoints/stage2_horizon=1/e=epoch=12-l=val_loss_anticipation=0.022330984473228455-val_acc=val_acc=0.829586386680603horizon=1-stage2_model_best.ckpt",
     )

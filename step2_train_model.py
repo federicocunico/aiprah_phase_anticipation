@@ -16,6 +16,7 @@ from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from datasets.cholec80 import Cholec80Dataset
+from datasets.heichole import HeiCholeDataset
 from models.membank_model import MemBankResNetLSTM
 from models.memory_bank import MemoryBank
 from models.temporal_model_v1 import TemporalResNetLSTM
@@ -31,12 +32,13 @@ from memory_bank_utils import (
 )
 
 
-def train_model(time_horizon: int):
+def train_model(args):
     seed_everything(0)
+    time_horizon = args.time_horizon
 
-    log_dir = f"checkpoints/stage2_horizon={time_horizon}"
+    log_dir = f"checkpoints/{args.exp_name}_stage2_horizon={time_horizon}"
     wandb_logger = WandbLogger(
-        name=f"stage2-time_horizon={time_horizon}", project="cholec80"
+        name=f"{args.exp_name}_stage2-time_horizon={time_horizon}", project="cholec80"
     )
     # -------------------
     # Hyperparameters
@@ -53,15 +55,21 @@ def train_model(time_horizon: int):
     # mb_pretrained_model = "./wandb/run-stage1/checkpoints/membank_best.pth"
 
     # device = torch.device("cuda:0")
+    if args.dataset == "cholec80":
+        data_dir = "./data/cholec80"
+        SWADataset = Cholec80Dataset
+    elif args.dataset == "heichole":
+        data_dir = "./data/heichole"
+        SWADataset = HeiCholeDataset
 
-    train_dataset = Cholec80Dataset(
-        root_dir="./data/cholec80", mode="train", seq_len=seq_len, fps=target_fps
+    train_dataset = SWADataset(
+        root_dir=data_dir, mode="train", seq_len=seq_len, fps=target_fps
     )
-    val_dataset = Cholec80Dataset(
-        root_dir="./data/cholec80", mode="val", seq_len=seq_len, fps=target_fps
+    val_dataset = SWADataset(
+        root_dir=data_dir, mode="val", seq_len=seq_len, fps=target_fps
     )
-    test_dataset = Cholec80Dataset(
-        root_dir="./data/cholec80", mode="test", seq_len=seq_len, fps=target_fps
+    test_dataset = SWADataset(
+        root_dir=data_dir, mode="test", seq_len=seq_len, fps=target_fps
     )
     # train_dataset = Cholec80Dataset(root_dir="./data/cholec80", mode="demo_train", seq_len=seq_len, fps=target_fps)
     # val_dataset = Cholec80Dataset(root_dir="./data/cholec80", mode="demo_val", seq_len=seq_len, fps=target_fps)
@@ -128,6 +136,7 @@ def train_model(time_horizon: int):
     )
     trainer = Trainer(
         accelerator="auto",
+        devices=[args.gpu],
         precision="bf16-mixed",
         max_epochs=epochs,
         callbacks=[ckpt_save],
@@ -143,8 +152,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train the model")
     parser.add_argument(
+        "--gpu", type=int, default=0, help="GPU device index to use for training"
+    )
+    parser.add_argument(
+        "--exp_name", type=str, default="TEST", help="Experiment name"
+    )
+    parser.add_argument(
+        "--dataset", type=str, default="heichole", help="Dataset to use for training"
+    )
+    parser.add_argument(
         "--time_horizon", type=int, default=5, help="Time horizon for anticipation"
     )
     args = parser.parse_args()
 
-    train_model(time_horizon=args.time_horizon)
+    train_model(args)
