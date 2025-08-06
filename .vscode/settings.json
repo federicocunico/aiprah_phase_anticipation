@@ -1,0 +1,34 @@
+{
+    "files.exclude": {
+        "**/.git": true,
+        "**/.venv": true,
+        "**/__pycache__": true,
+        "**/node_modules": true,
+        "**/*.log": true,
+        "**/build": true,
+        "**/dist": true
+    },
+    "search.exclude": {
+        "**/node_modules": true,
+        "**/build": true,
+        "**/dist": true,
+        "**/.venv": true
+    },
+    "python.analysis.exclude": [
+        "**/node_modules",
+        "**/build",
+        "**/dist",
+        "**/.venv",
+        "**/.git",
+        "**/__pycache__",
+        "**/data",
+        "**/checkpoints",
+    ],
+    "python-envs.pythonProjects": [
+        {
+            "path": "",
+            "envManager": "ms-python.python:conda",
+            "packageManager": "ms-python.python:conda"
+        }
+    ]
+}

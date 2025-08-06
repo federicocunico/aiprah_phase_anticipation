@@ -1,0 +1,30 @@
+Phase Classification Evaluation:
+Accuracy: 0.7869
+Precision: 0.7316
+Recall: 0.7161
+F1 Score: 0.7127
+Confusion Matrix:
+[[  772   512     4    12     1    38    60]
+ [  212 11239   669  2090    76   381    89]
+ [    0   152  1738   858     0   115     0]
+ [   16   179    25  8993   127   196    11]
+ [    9     6     0    47   669   456    60]
+ [   11    25     3   261    34  2749   404]
+ [   14     0     0     0     5   178   932]]
+Classification Report:
+0: {'precision': 0.746615087040619, 'recall': 0.5518227305218013, 'f1-score': 0.6346074804767776, 'support': 1399.0}
+1: {'precision': 0.9278461157434161, 'recall': 0.7616562754133912, 'f1-score': 0.8365774684580743, 'support': 14756.0}
+2: {'precision': 0.7125871258712587, 'recall': 0.6070555361508907, 'f1-score': 0.6556016597510373, 'support': 2863.0}
+3: {'precision': 0.7334638283989887, 'recall': 0.9419712998847806, 'f1-score': 0.8247432134996332, 'support': 9547.0}
+4: {'precision': 0.7335526315789473, 'recall': 0.5364875701684042, 'f1-score': 0.619731357109773, 'support': 1247.0}
+5: {'precision': 0.6683685874057865, 'recall': 0.7883567536564382, 'f1-score': 0.723421052631579, 'support': 3487.0}
+6: {'precision': 0.5989717223650386, 'recall': 0.8255093002657219, 'f1-score': 0.6942271880819367, 'support': 1129.0}
+accuracy: 0.7869176251887998
+macro avg: {'precision': 0.7316292997720079, 'recall': 0.7161227808659183, 'f1-score': 0.7127013457155444, 'support': 34428.0}
+weighted avg: {'precision': 0.804575007905986, 'recall': 0.7869176251887998, 'f1-score': 0.7860555567877682, 'support': 34428.0}
+
+Anticipation Evaluation Metrics for Cholec80:
+inMAE (in-horizon MAE): 1.8483
+oMAE (out-of-horizon MAE): 0.0854
+wMAE (weighted MAE): 0.9669
+eMAE (very-short-term MAE): 1.8483
