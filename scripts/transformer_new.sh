@@ -23,7 +23,6 @@ for cfg in "${CONFIGS[@]}"; do
 
   $PYTHON "$SCRIPT" \
     --exp_name "$exp_name" \
-    --use_wandb \
     --wandb_project "$WANDB_PROJECT" \
     --in_channels "$channels" \
     $rgbd_flag

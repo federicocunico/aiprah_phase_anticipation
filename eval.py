@@ -13,6 +13,7 @@ from sklearn.metrics import (
     recall_score,
 )
 from tqdm import tqdm
+from datasets.peg_and_ring_workflow import PegAndRing
 from trainer import PhaseAnticipationTrainer
 from models.temporal_model_v5 import TemporalAnticipationModel
 from datasets.cholec80 import Cholec80Dataset
@@ -82,23 +83,47 @@ def aggregate_predictions(out, aggregator_window_size=5):
     return aggregated
 
 
-def eval_model(split: str, horizon: int, final_model: str):
+def eval_model(
+    split: str,
+    horizon: int,
+    final_model: str,
+    seq_len: int,
+    exp_name: str = None,
+    num_classes: int = 7,
+    dataset: str = "cholec80",
+):
     torch.set_float32_matmul_precision("high")  # 'high' or 'medium'; for RTX GPUs
-    seq_len = 30
+    # seq_len = 30
     target_fps = 1
-    num_classes = 7
     device = torch.device("cuda:0")
 
-    fname = f"results/eval_split={split}_horizon={horizon}.pickle"
+    if exp_name is None:
+        exp_name = f"cholec80"
+
+    fname = f"results/{exp_name}/eval_split={split}_horizon={horizon}.pickle"
+
+    # makedirs of fname
+    os.makedirs(os.path.dirname(fname), exist_ok=True)
 
     model = TemporalAnticipationModel(
         time_horizon=horizon, sequence_length=seq_len, num_classes=num_classes
     )
     # If evaluation output does not exist, run the model on the dataset and save outputs.
     if not os.path.exists(fname):
-        dataset = Cholec80Dataset(
-            root_dir="./data/cholec80", mode=split, seq_len=seq_len, fps=target_fps
-        )
+        if dataset == "cholec80":
+            dataset_obj = Cholec80Dataset(
+                root_dir="./data/cholec80", mode=split, seq_len=seq_len, fps=target_fps
+            )
+        elif dataset == "peg_and_ring":
+            dataset_obj = PegAndRing(
+                root_dir="./data/peg_and_ring_workflow",
+                mode=split,
+                seq_len=seq_len,
+                fps=target_fps,
+            )
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}")
+
         pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=None)
 
         # Load pretrained-checkpoint.
@@ -118,7 +143,9 @@ def eval_model(split: str, horizon: int, final_model: str):
         out = {}
         with torch.no_grad():
             model.eval()
-            for i, (frames, metadata) in tqdm(enumerate(dataset), total=len(dataset)):
+            for i, (frames, metadata) in tqdm(
+                enumerate(dataset_obj), total=len(dataset_obj)
+            ):
                 frames = frames.to(device=device, dtype=dtype).unsqueeze(0)
                 start = time.time()
                 model_output = model(frames)
@@ -148,7 +175,9 @@ def eval_model(split: str, horizon: int, final_model: str):
                     .numpy()
                     .tolist()[0],  # list of floats, length=num_classes
                     "gt_anticipated_phase": torch.clamp(
-                        metadata["time_to_next_phase"], 0, model.time_horizon
+                        torch.as_tensor(metadata["time_to_next_phase"]),
+                        0,
+                        model.time_horizon,
                     )
                     .cpu()
                     .numpy()
@@ -214,7 +243,9 @@ def eval_model(split: str, horizon: int, final_model: str):
     plt.colorbar()
     plt.xticks(range(num_classes))
     plt.yticks(range(num_classes))
-    plt.savefig(f"results/cholec80_{split}_confusion_matrix_horizon={horizon}.png")
+    plt.savefig(
+        f"results/{exp_name}/{dataset}_{split}_confusion_matrix_horizon={horizon}.png"
+    )
     plt.close()
 
     # 2. Anticipation Error Metrics (inMAE, oMAE, wMAE, eMAE)
@@ -253,14 +284,16 @@ def eval_model(split: str, horizon: int, final_model: str):
     e_errors = abs_errors[e_indices] if np.any(e_indices) else np.array([])
     eMAE = np.mean(e_errors) if e_errors.size > 0 else 0
 
-    print("\nAnticipation Evaluation Metrics for Cholec80:")
+    print(f"\nAnticipation Evaluation Metrics for {dataset}:")
     print(f"inMAE (in-horizon MAE): {inMAE:.4f}")
     print(f"oMAE (out-of-horizon MAE): {oMAE:.4f}")
     print(f"wMAE (weighted MAE): {wMAE:.4f}")
     print(f"eMAE (very-short-term MAE): {eMAE:.4f}")
 
     # Save evaluation results to a text file.
-    with open(f"results/results_cholec80_split={split}_horizon={horizon}.txt", "w") as fp:
+    with open(
+        f"results/{exp_name}/results_{dataset}_split={split}_horizon={horizon}.txt", "w"
+    ) as fp:
         fp.write("Phase Classification Evaluation:\n")
         fp.write(f"Accuracy: {accuracy:.4f}\n")
         fp.write(f"Precision: {precision:.4f}\n")
@@ -271,44 +304,98 @@ def eval_model(split: str, horizon: int, final_model: str):
         fp.write("Classification Report:\n")
         for cls, metrics in class_report.items():
             fp.write(f"{cls}: {metrics}\n")
-        fp.write("\nAnticipation Evaluation Metrics for Cholec80:\n")
+        fp.write(f"\nAnticipation Evaluation Metrics for {dataset}:\n")
         fp.write(f"inMAE (in-horizon MAE): {inMAE:.4f}\n")
         fp.write(f"oMAE (out-of-horizon MAE): {oMAE:.4f}\n")
         fp.write(f"wMAE (weighted MAE): {wMAE:.4f}\n")
         fp.write(f"eMAE (very-short-term MAE): {eMAE:.4f}\n")
 
+    # Creating visualizations
+    print("Creating line-plots visualizations...")
+    for video_name, video_data in aggregated_out.items():
+        img_fname = f"results/{exp_name}/{dataset}_{video_name}_seq_len={seq_len}_split={split}_predicted_time_to_next_phase.png"
+        os.makedirs(os.path.dirname(img_fname), exist_ok=True)
+        arr = np.array([v["pred_anticipated_phase"] for v in video_data])
+        gts = np.array([v["gt_anticipated_phase"] for v in video_data])
+        # create a 7‐row subplot, one for each class
+        fig, axs = plt.subplots(num_classes, 1, sharex=True, figsize=(12, 14))
+        for i in range(num_classes):
+            axs[i].plot(
+                arr[:, i], linestyle="-", color="blue", label="Predicted", linewidth=2
+            )
+            axs[i].plot(
+                gts[:, i],
+                linestyle="--",
+                color="red",
+                label="Ground Truth",
+                linewidth=2,
+            )
+            axs[i].set_ylabel(f"Phase {i}")
+            axs[i].grid(True)
+            axs[i].set_ylim(0, model.time_horizon * 1.05)
+
+        # common labels and title
+        axs[-1].set_xlabel("Frame index")
+        fig.suptitle("Predicted Time to Next Phase")
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(img_fname)
+
 
 if __name__ == "__main__":
-    ## HORIZON = 5
-    eval_model(
-        "test",
-        horizon=5,
-        final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
-    )
+    # ## HORIZON = 5
+    # eval_model(
+    #     "test",
+    #     horizon=5,
+    #     final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
+    # )
+    # eval_model(
+    #     "val",
+    #     horizon=5,
+    #     final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
+    # )
+    # ## HORIZON = 3
+    # eval_model(
+    #     "test",
+    #     horizon=3,
+    #     final_model="checkpoints/stage2_horizon=3/e=epoch=47-l=val_loss_anticipation=0.023974817246198654-val_acc=val_acc=0.8197687864303589_horizon=3-stage2_model_best.ckpt",
+    # )
+    # eval_model(
+    #     "val",
+    #     horizon=3,
+    #     final_model="checkpoints/stage2_horizon=3/e=epoch=47-l=val_loss_anticipation=0.023974817246198654-val_acc=val_acc=0.8197687864303589_horizon=3-stage2_model_best.ckpt",
+    # )
+    # ## HORIZON = 1
+    # eval_model(
+    #     "test",
+    #     horizon=1,
+    #     final_model="checkpoints/stage2_horizon=1/e=epoch=12-l=val_loss_anticipation=0.022330984473228455-val_acc=val_acc=0.829586386680603horizon=1-stage2_model_best.ckpt",
+    # )
+    # eval_model(
+    #     "val",
+    #     horizon=1,
+    #     final_model="checkpoints/stage2_horizon=1/e=epoch=12-l=val_loss_anticipation=0.022330984473228455-val_acc=val_acc=0.829586386680603horizon=1-stage2_model_best.ckpt",
+    # )
+
     eval_model(
         "val",
         horizon=5,
-        final_model="checkpoints/e=epoch=23-l=val_loss_anticipation=0.027181584388017654-stage2_model_best.ckpt",
+        final_model="checkpoints/cholec80_t=5_s=4_stage2_horizon=5/e=epoch=31-l=val_loss_anticipation=0.03390774503350258-val_acc=val_acc=0.7710379958152771_horizon=5-stage2_model_best.ckpt",
+        seq_len=4,
+        exp_name="cholec80/seq_len=4",
     )
-    ## HORIZON = 3
-    eval_model(
-        "test",
-        horizon=3,
-        final_model="checkpoints/stage2_horizon=3/e=epoch=47-l=val_loss_anticipation=0.023974817246198654-val_acc=val_acc=0.8197687864303589_horizon=3-stage2_model_best.ckpt",
-    )
+
     eval_model(
         "val",
-        horizon=3,
-        final_model="checkpoints/stage2_horizon=3/e=epoch=47-l=val_loss_anticipation=0.023974817246198654-val_acc=val_acc=0.8197687864303589_horizon=3-stage2_model_best.ckpt",
+        horizon=5,
+        final_model="checkpoints/cholec80_t=5_s=10_stage2_horizon=5/e=epoch=41-l=val_loss_anticipation=0.030996935442090034-val_acc=val_acc=0.7872610092163086_horizon=5-stage2_model_best.ckpt",
+        seq_len=10,
+        exp_name="cholec80/seq_len=10",
     )
-    ## HORIZON = 1
-    eval_model(
-        "test",
-        horizon=1,
-        final_model="checkpoints/stage2_horizon=1/e=epoch=12-l=val_loss_anticipation=0.022330984473228455-val_acc=val_acc=0.829586386680603horizon=1-stage2_model_best.ckpt",
-    )
+
     eval_model(
         "val",
-        horizon=1,
-        final_model="checkpoints/stage2_horizon=1/e=epoch=12-l=val_loss_anticipation=0.022330984473228455-val_acc=val_acc=0.829586386680603horizon=1-stage2_model_best.ckpt",
+        horizon=5,
+        final_model="checkpoints/cholec80_t=5_s=30_stage2_horizon=5/e=epoch=19-l=val_loss_anticipation=0.028951309621334076-val_acc=val_acc=0.8010921478271484_horizon=5-stage2_model_best.ckpt",
+        seq_len=30,
+        exp_name="cholec80/seq_len=30",
     )

@@ -7,4 +7,13 @@ data/*
 
 wandb/
 
+results/
+checkpoints/
+
+# TMP
 bak_v1/
+stuff_to_sort/
+
+test_time_phase.png
+val_time_phase.png
+*.pth

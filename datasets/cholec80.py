@@ -131,13 +131,15 @@ def load_annotation(annotation_path: str, subsample_fps: int) -> np.ndarray:
 
 
 class Cholec80Dataset(Dataset):
-    def __init__(self, root_dir: str, mode: str = "train", seq_len: int = 10, fps: int = 1):
+    def __init__(self, root_dir: str, mode: str = "train", seq_len: int = 10, fps: int = 1, rgbd: bool = False):
         super(Cholec80Dataset, self).__init__()
 
         self.root_dir = root_dir
         self.mode = mode
         self.target_fps = fps
         self.seq_len = seq_len
+
+        self.rgbd_mode = rgbd
 
         self.train_transform = transforms.Compose(
             [
@@ -422,7 +424,7 @@ class Cholec80Dataset(Dataset):
         frames = torch.stack([self.transform(Image.open(f)) for f in metadata["frames_filepath"]])
 
         # load depths if available
-        if "frames_depths" in metadata:
+        if "frames_depths" in metadata and self.rgbd_mode:
             # depths = torch.stack([torch.tensor(np.load(f)) for f in metadata["frames_depths"]])
             depths = torch.stack([torch.tensor(np.load(f)) for f in metadata["frames_depths"]])
             # transform depths

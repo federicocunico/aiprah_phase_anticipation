@@ -4,7 +4,6 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
             "name": "Python Debugger: Current File",
             "type": "debugpy",
@@ -15,6 +14,32 @@
             },
             "console": "integratedTerminal",
             "justMyCode": false,
+        },
+        {
+            "name": "Train PegAndRing (GPU 1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/step2_train_model.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--gpu",
+                "1",
+                "--time_horizon",
+                "1",
+                "--seq_len",
+                "4",
+                "--batch_size",
+                "32",
+                "--dataset",
+                "peg_and_ring",
+                "--num_classes",
+                "6",
+                "--exp_name",
+                "pegandring_t=1_s=4",
+                "--wandb_project",
+                "SWA"
+            ]
         }
     ]
 }

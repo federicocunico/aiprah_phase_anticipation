@@ -19,20 +19,15 @@ from datasets.cholec80 import Cholec80Dataset
 from datasets.heichole import HeiCholeDataset
 
 # Model import
-from models.temporal_model_swin import TemporalAnticipationModel
-from models.temporal_model_swin_v2 import create_model
+# from models.temporal_model_swin import TemporalAnticipationModel
+# from models.temporal_model_swin_v2 import create_model
+from models.temporal_model_swin_v3 import create_model
 
 
 # Loss imports
 from losses.weighted_regr_loss import WeightedMSELoss
 
-# Optional: Weights & Biases logging
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    print("Warning: wandb not available. Install with 'pip install wandb' for experiment tracking.")
+import wandb
 
 
 class TrainingMetrics:
@@ -179,8 +174,12 @@ def train_epoch(model, train_loader, optimizer, loss_criterion, device, use_rgbd
         # Update progress bar
         pbar.set_postfix({
             'loss': f"{results['loss'].item():.4f}",
-            'anticip': f"{results['loss_anticipation']:.4f}",
+            # 'anticip': f"{results['loss_anticipation']:.4f}",
             # 'phase': f"{results['loss_phase']:.4f}",
+        })
+
+        wandb.log({
+            'train_step_loss': results['loss'].item(),
         })
     
     return metrics.compute_metrics()
@@ -213,7 +212,7 @@ def validate_epoch(model, val_loader, loss_criterion, device, use_rgbd, save_plo
             # Update progress bar
             pbar.set_postfix({
                 'loss': f"{results['loss'].item():.4f}",
-                'anticip': f"{results['loss_anticipation']:.4f}"
+                # 'anticip': f"{results['loss_anticipation']:.4f}"
             })
     
     computed_metrics = metrics.compute_metrics()
@@ -278,13 +277,13 @@ def train_model(args):
         json.dump(vars(args), f, indent=2)
     
     # Initialize wandb if available
-    if WANDB_AVAILABLE and args.use_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=exp_name,
-            config=vars(args),
-            dir=log_dir
-        )
+    
+    wandb.init(
+        project=args.wandb_project,
+        name=exp_name,
+        config=vars(args),
+        dir=log_dir
+    )
     
     # Create data loaders
     print("\nCreating data loaders...")
@@ -325,18 +324,26 @@ def train_model(args):
     # Create model
     print(f"\nCreating model with {args.in_channels} input channels...")
 
+    # model_config = {
+    #     "sequence_length" : args.seq_len,  # T=30 frames
+    #     "num_classes" : args.num_classes,    # 7 surgical phases
+    #     "time_horizon" : args.time_horizon,   # 5 minutes anticipation
+    #     "in_channels" : args.in_channels,     # 3 for RGB, 4 for RGB-D
+    #     "swin_model_size" : "base",           # Best balance for surgical detail recognition
+    #     "temporal_processor" : "bert",         # Better for short sequences
+    #     "num_encoder_layers" : 8,             # Increased for surgical complexity
+    #     "num_decoder_layers" : 4,             # Lighter decoder for efficiency
+    #     "nhead" : 12,                          # More attention heads for fine details
+    #     "use_pretrained_bert" : True,         # Leverage pre-trained knowledge
+    #     "bert_model_name" : "bert-base-uncased"  # Better performance than BERT
+    # }
+    # model = create_model(**model_config).to(device)
+
     model_config = {
-        "sequence_length" : args.seq_len,  # T=30 frames
-        "num_classes" : args.num_classes,    # 7 surgical phases
-        "time_horizon" : args.time_horizon,   # 5 minutes anticipation
-        "in_channels" : args.in_channels,     # 3 for RGB, 4 for RGB-D
-        "swin_model_size" : "base",           # Best balance for surgical detail recognition
-        "temporal_processor" : "bert",         # Better for short sequences
-        "num_encoder_layers" : 8,             # Increased for surgical complexity
-        "num_decoder_layers" : 4,             # Lighter decoder for efficiency
-        "nhead" : 12,                          # More attention heads for fine details
-        "use_pretrained_bert" : True,         # Leverage pre-trained knowledge
-        "bert_model_name" : "bert-base-uncased"  # Better performance than BERT
+        "sequence_length": args.seq_len,
+        "num_classes": args.num_classes,
+        "time_horizon": args.time_horizon,
+        "in_channels": args.in_channels,  # RGB-D input
     }
     model = create_model(**model_config).to(device)
     
@@ -405,16 +412,15 @@ def train_model(args):
               f"MSE: {val_metrics.get('anticip_mse', 0):.4f}")
         
         # Log to wandb
-        if WANDB_AVAILABLE and args.use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'train_loss': train_metrics['loss'],
-                'train_acc': train_metrics['accuracy'],
-                'val_loss': val_metrics['loss'],
-                'val_acc': val_metrics['accuracy'],
-                'val_anticip_mse': val_metrics.get('anticip_mse', 0),
-                'lr': optimizer.param_groups[0]['lr']
-            })
+        wandb.log({
+            'epoch': epoch,
+            'train_loss': train_metrics['loss'],
+            'train_acc': train_metrics['accuracy'],
+            'val_loss': val_metrics['loss'],
+            'val_acc': val_metrics['accuracy'],
+            'val_anticip_mse': val_metrics.get('anticip_mse', 0),
+            'lr': optimizer.param_groups[0]['lr']
+        })
         
         # Save checkpoint
         checkpoint_path = os.path.join(log_dir, f"checkpoint_epoch_{epoch+1}.pth")
@@ -481,13 +487,12 @@ def train_model(args):
         json.dump(results, f, indent=2)
     
     # Log final results to wandb
-    if WANDB_AVAILABLE and args.use_wandb:
-        wandb.log({
-            "test_acc": test_metrics['accuracy'],
-            "test_f1": test_metrics['f1'],
-            "test_anticip_mse": test_metrics.get('anticip_mse', 0),
-        })
-        wandb.finish()
+    wandb.log({
+        "test_acc": test_metrics['accuracy'],
+        "test_f1": test_metrics['f1'],
+        "test_anticip_mse": test_metrics.get('anticip_mse', 0),
+    })
+    wandb.finish()
     
     print(f"\nTraining completed! Results saved to {log_dir}")
 
@@ -502,8 +507,6 @@ def main():
                         help="Experiment name for logging")
     parser.add_argument("--wandb_project", type=str, default="cholec80", 
                         help="Weights & Biases project name")
-    parser.add_argument("--use_wandb", action="store_true",
-                        help="Use Weights & Biases for logging")
     parser.add_argument("--seed", type=int, default=42, 
                         help="Random seed for reproducibility")
     parser.add_argument("--debug", action="store_true", 

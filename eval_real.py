@@ -81,13 +81,13 @@ arr = np.array(result).squeeze(axis=1)
 fig, axs = plt.subplots(7, 1, sharex=True, figsize=(12, 14))
 for i in range(7):
     axs[i].plot(arr[:, i], marker="o", linestyle="-")
-    axs[i].set_ylabel(f"Class {i}")
+    axs[i].set_ylabel(f"Phase {i}")
     axs[i].grid(True)
     axs[i].set_ylim(0, 5.5)
 
 # common labels and title
 axs[-1].set_xlabel("Frame index")
-fig.suptitle("Predicted Time to Next Phase per Class")
+fig.suptitle("Predicted Time to Next Phase")
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
 # save the final report image

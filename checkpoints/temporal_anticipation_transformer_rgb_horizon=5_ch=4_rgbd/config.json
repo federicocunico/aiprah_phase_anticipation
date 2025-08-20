@@ -1,7 +1,6 @@
 {
   "exp_name": "temporal_anticipation_transformer_rgb",
   "wandb_project": "cholec80",
-  "use_wandb": true,
   "seed": 42,
   "debug": false,
   "in_channels": 4,
