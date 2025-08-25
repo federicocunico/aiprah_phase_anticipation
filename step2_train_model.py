@@ -9,9 +9,11 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 from tqdm import tqdm
 from eval import eval_model
 from losses.loss import ModelLoss
+from losses.smooth_l1_weighted import InteriorWeightedSmoothL1
 from losses.swag_loss import SWAGLoss
 from losses.ce_regr_loss import CERegrLoss
 from losses.weighted_regr_loss import WeightedMSELoss
+from models.temporal_hope import GRUSeqRegressor
 from trainer import PhaseAnticipationTrainer
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -19,14 +21,9 @@ from pytorch_lightning.loggers import WandbLogger
 from datasets.cholec80 import Cholec80Dataset
 from datasets.peg_and_ring_workflow import PegAndRing
 from datasets.heichole import HeiCholeDataset
-# from models.membank_model import MemBankResNetLSTM
-# from models.memory_bank import MemoryBank
-# from models.temporal_model_v1 import TemporalResNetLSTM
 
-# from models.temporal_model_v2 import TemporalAnticipationModel
-# from models.temporal_model_v3 import TemporalAnticipationModel
-# from models.temporal_model_v4 import TemporalAnticipationModel
 from models.temporal_model_v5 import TemporalAnticipationModel
+from models.temporal_transformer import SwinTemporalDecoderRegressor
 
 # from memory_bank_utils import (
 #     create_memorybank,
@@ -123,8 +120,23 @@ def train_model(args):
     # )
     # model = TemporalResNetLSTM(backbone=backbone, memory_bank=mb, sequence_length=seq_len, num_classes=num_classes)
 
-    model = TemporalAnticipationModel(
-        time_horizon=time_horizon, sequence_length=seq_len, num_classes=num_classes
+    # model = TemporalAnticipationModel(
+    #     time_horizon=time_horizon, sequence_length=seq_len, num_classes=num_classes
+    # )
+
+    # model = SwinTemporalDecoderRegressor(
+    #     time_horizon=time_horizon, sequence_length=seq_len, num_classes=num_classes
+    # )
+    model = GRUSeqRegressor(
+        sequence_length=seq_len,
+        num_classes=num_classes,
+        time_horizon=time_horizon,
+        backbone_name="resnet18",
+        pretrained_backbone=False,  # set True for real training
+        freeze_backbone=False,      # allow learning in demo for faster convergence
+        d_model=256,                # smaller for CPU speed
+        gru_layers=1,
+        dropout=0.1,
     )
 
     # -------------------
@@ -133,7 +145,8 @@ def train_model(args):
     # loss_criterion = ModelLoss(l1=l1, l2=l2, multitask_strategy=multitask_strategy)
     # loss_criterion = SWAGLoss(10, 5)
     loss_criterion = nn.SmoothL1Loss(reduction="mean")  # WeightedMSELoss()
-    pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=loss_criterion)
+    # loss_criterion = InteriorWeightedSmoothL1(time_horizon=time_horizon, alpha=3.0, base_weight=0.2, beta=1.0)
+    pl_model = PhaseAnticipationTrainer(model=model, loss_criterion=loss_criterion, multi_task=True)
 
     ckpt_save = ModelCheckpoint(
         dirpath=f"{log_dir}",

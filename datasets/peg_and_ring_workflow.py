@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+import os
+
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 import re
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional, Callable
+from typing import List, Tuple, Dict, Any, Optional, Callable, Iterator, Sequence
 from tqdm import tqdm
 import cv2
 import numpy as np
@@ -10,6 +14,8 @@ import copy
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data.sampler import Sampler
+from torch.utils.data import BatchSampler
 import torchvision.transforms as transforms
 from torchvision.transforms import (
     Resize,
@@ -57,7 +63,6 @@ def _get_total_frames_and_fps_cv2(video_path: Path) -> Tuple[int, float]:
     cap.release()
 
     if total <= 0:
-        # fallback: brute count
         cap = cv2.VideoCapture(str(video_path))
         total = 0
         while True:
@@ -77,40 +82,22 @@ def _get_total_frames_and_fps_cv2(video_path: Path) -> Tuple[int, float]:
 def _map_1fps_index_to_source_frame(
     i_1fps: int, fps: float, total_frames: int, n_1fps: int
 ) -> int:
-    # 1fps frames are taken at t=i seconds from t=0 → nearest source frame
     src = int(round(i_1fps * fps))
     return min(max(src, 0), total_frames - 1)
 
 
 def _show_plot(time_horizon: float | None = 1.0):
-    """
-    Create a 6-row subplot (phases 0..5) comparing predicted vs ground truth anticipation,
-    for each video discovered by the PegAndRing dataset.
-
-    Convention for predictions (per video):
-        <root>/<videoname>_1fps/<videoname>_pred_1fps_<time>.npy
-
-    where:
-      - <time> is "seconds" or "minutes"
-
-    If a prediction file isn't found, this function will:
-      - (TODO) Replace the 'dummy' line with your model inference to produce preds (Nx6),
-        or drop a file at the path above.
-      - For now it will plot only the ground truth (and warn).
-    """
-
-    # --------- user-configurable ---------
     root = "data/peg_and_ring_workflow"
     root_path = Path(root)
-    time_unit = "minutes"  # "seconds" or "minutes"
-    # time_horizon = 1.0  # cap horizon (in the chosen unit)
-    clamp_fn = lambda x: torch.clamp(torch.asarray(x), max=time_horizon).numpy() if time_horizon is not None else x
-    # -------------------------------------
+    time_unit = "minutes"
+    clamp_fn = lambda x: (
+        torch.clamp(torch.asarray(x), min=0, max=time_horizon).numpy()
+        if time_horizon is not None
+        else x
+    )
 
-    # Instantiate dataset (already computes GT anticipation in requested unit)
     ds = PegAndRing(root_dir=root, mode="train", seq_len=10, time_unit=time_unit)
 
-    # Per-video indexing
     by_video = {}
     for videoname, frames_dir, frame_path, local_idx in ds.index:
         if videoname not in by_video:
@@ -120,23 +107,19 @@ def _show_plot(time_horizon: float | None = 1.0):
             }
         by_video[videoname]["N"] = max(by_video[videoname]["N"], local_idx + 1)
 
-    # Unit tag like dataset cache (but no horizon)
     unit_tag = f"{time_unit.lower()}"
 
     for videoname, meta in by_video.items():
         frames_dir: Path = meta["frames_dir"]
         N = meta["N"]
 
-        # Ground-truth anticipation (Nx6 float)
-        gts = ds.ant_cache[videoname]  # already (N,6)
+        gts = ds.ant_cache[videoname]
         if gts.shape[0] != N:
             N = min(N, gts.shape[0])
             gts = gts[:N]
 
-        # ---- clamp GT to horizon ----
         gts = clamp_fn(gts)
 
-        # Try to load predictions
         pred_path = frames_dir / f"{videoname}_pred_1fps_{unit_tag}.npy"
         if pred_path.exists():
             arr = np.load(pred_path)
@@ -145,40 +128,27 @@ def _show_plot(time_horizon: float | None = 1.0):
                     f"[WARN] {videoname}: predictions shape {arr.shape} != ({N},6). Clipping."
                 )
                 arr = arr[:N, :6]
-            # ---- clamp predictions to horizon ----
-            arr = torch.clamp(torch.from_numpy(arr), max=clamp).numpy()
+            arr = clamp_fn(arr)
         else:
             print(f"[WARN] {videoname}: prediction file not found: {pred_path}")
             arr = None
 
-        # ---- Plot: 6 rows, one per phase ----
         fig, axs = plt.subplots(6, 1, sharex=True, figsize=(12, 12))
-
-        # y-axis: horizon + small margin
-        y_upper = time_horizon * 1.05
+        y_upper = time_horizon * 1.05 if time_horizon is not None else None
 
         x = np.arange(N)
         for i in range(6):
             if arr is not None:
                 axs[i].plot(
-                    x,
-                    arr[:N, i],
-                    linestyle="-",
-                    color="blue",
-                    label="Predicted",
-                    linewidth=2,
+                    x, arr[:N, i], linestyle="-", label="Predicted", linewidth=2
                 )
             axs[i].plot(
-                x,
-                gts[:N, i],
-                linestyle="--",
-                color="red",
-                label="Ground Truth",
-                linewidth=2,
+                x, gts[:N, i], linestyle="--", label="Ground Truth", linewidth=2
             )
             axs[i].set_ylabel(f"Phase {i}")
             axs[i].grid(True)
-            axs[i].set_ylim(0, y_upper)
+            if y_upper is not None:
+                axs[i].set_ylim(0, y_upper)
 
         axs[-1].set_xlabel("Frame index (1 FPS)")
         fig.suptitle(
@@ -215,8 +185,8 @@ class PegAndRing(Dataset):
         "frames_indexes": torch.asarray([int]*T)
         "phase_label": torch.asarray(int)                    # last frame
         "phase_label_dense": torch.asarray([int]*T)
-        "time_to_next_phase_dense": np.ndarray [NUM_CLASSES, T] float  (in requested unit)
-        "time_to_next_phase": np.ndarray [NUM_CLASSES] float            (in requested unit, last frame)
+        "time_to_next_phase_dense": np.ndarray [NUM_CLASSES, T] float
+        "time_to_next_phase": np.ndarray [NUM_CLASSES] float
         "future_targets": torch.LongTensor [T, F, NUM_CLASSES]
         # optional (only present if rgbd_mode=True AND depths exist for the window):
         "frames_depths": [T] list[str]
@@ -229,18 +199,18 @@ class PegAndRing(Dataset):
         root_dir: str,
         mode: str = "train",
         seq_len: int = 10,
-        fps: int = 1,  # frames per second for 1fps frames
+        fps: int = 1,
         *,
         stride: int = 1,
-        time_unit: str = "minutes",  # "seconds" or "minutes"
+        time_unit: str = "minutes",
         mean: Tuple[float, float, float] = (0.26728517, 0.32384375, 0.2749076),
         std: Tuple[float, float, float] = (0.15634732, 0.167153, 0.15354523),
-        transform: Optional[Callable] = None,  # PIL -> Tensor [3,H,W]
+        transform: Optional[Callable] = None,
         to_rgb: bool = True,
         dtype: torch.dtype = torch.float32,
         rgbd_mode: bool = False,
-        depth_dir_name: Optional[str] = None,  # e.g. "<videoname>_1fps_depths"
-        rgbd_transform: Optional[Callable] = None,  # [T,1,H,W] -> [T,H,W]
+        depth_dir_name: Optional[str] = None,
+        rgbd_transform: Optional[Callable] = None,
         future_F: int = 1,
         add_depth_to_frames: bool = True,
     ):
@@ -249,18 +219,11 @@ class PegAndRing(Dataset):
 
         self.root = Path(root_dir)
         self.mode = mode.lower().strip()
-        assert self.mode in (
-            "train",
-            "val",
-            "test",
-        ), "mode must be 'train' or 'val' or 'test'"
+        assert self.mode in ("train", "val", "test")
         self.seq_len = int(seq_len)
         self.stride = int(stride)
         self.time_unit = time_unit.lower().strip()
-        assert self.time_unit in (
-            "seconds",
-            "minutes",
-        ), "time_unit must be 'seconds' or 'minutes'"
+        assert self.time_unit in ("seconds", "minutes")
         self.mean = torch.tensor(mean, dtype=dtype).view(3, 1, 1)
         self.std = torch.tensor(std, dtype=dtype).view(3, 1, 1)
         self.dtype = dtype
@@ -274,7 +237,6 @@ class PegAndRing(Dataset):
         self.future_F = int(future_F)
         self.add_depth_to_frames = add_depth_to_frames
 
-        # --------- default transforms ---------
         self.train_transform = transforms.Compose(
             [
                 Resize((250, 250)),
@@ -300,8 +262,7 @@ class PegAndRing(Dataset):
             else (self.test_transform if transform is None else transform)
         )
 
-        # --------- discover files and split ---------
-        val_videos = {"video01", "video04", "video06", "video08"}
+        val_videos = {"video01", "video04"}
         all_entries = _list_videos_with_1fps(self.root)
         if not all_entries:
             raise RuntimeError(
@@ -320,10 +281,9 @@ class PegAndRing(Dataset):
         if not entries:
             raise RuntimeError(f"No entries for split '{self.mode}'")
 
-        # --------- load anticipation (unit only) for 1fps frames ----------
         self.ant_cache: Dict[str, np.ndarray] = {}
-        self.meta: Dict[str, Tuple[int, float]] = {}  # videoname -> (total_frames,fps)
-        unit_tag = f"{self.time_unit}"  # no horizon in cache name
+        self.meta: Dict[str, Tuple[int, float]] = {}
+        unit_tag = f"{self.time_unit}"
 
         flat_index: List[Tuple[str, Path, Path, int]] = []
         for videoname, video_path, frames_dir, frame_paths in entries:
@@ -357,7 +317,6 @@ class PegAndRing(Dataset):
             for local_idx, fp in enumerate(frame_paths):
                 flat_index.append((videoname, frames_dir, fp, local_idx))
 
-        # --------- build sliding windows (NO None in metadata) ----------
         self.windows: List[Dict[str, Any]] = []
         by_video: Dict[str, Dict[str, Any]] = {}
         for idx, (videoname, frames_dir, frame_path, local_idx) in enumerate(
@@ -367,7 +326,7 @@ class PegAndRing(Dataset):
             by_video[videoname]["items"].append((idx, frame_path, local_idx))
 
         for videoname, bundle in by_video.items():
-            items = sorted(bundle["items"], key=lambda t: t[2])  # by local_idx
+            items = sorted(bundle["items"], key=lambda t: t[2])
             N = len(items)
             for start in range(0, max(0, N - self.seq_len + 1), self.stride):
                 end = start + self.seq_len
@@ -377,7 +336,6 @@ class PegAndRing(Dataset):
                 frame_idxs = [li for _, _, li in idxs]
                 frame_paths = [str(p) for _, p, _ in idxs]
 
-                # optional depths: include only if *all* depth files exist (avoid partial lists)
                 window: Dict[str, Any] = {}
                 if self.rgbd_mode:
                     frames_dir = bundle["frames_dir"]
@@ -396,10 +354,9 @@ class PegAndRing(Dataset):
                     if len(depth_paths_exist) == len(frame_paths):
                         window["frames_depths"] = depth_paths_exist
 
-                ant_1fps = self.ant_cache[videoname]  # [N1,6]
-                gts_window = ant_1fps[frame_idxs]  # [T,6] in requested unit
+                ant_1fps = self.ant_cache[videoname]
+                gts_window = ant_1fps[frame_idxs]
 
-                # dense phase labels
                 phase_dense = []
                 for row in gts_window:
                     z = np.where(row == 0.0)[0]
@@ -413,8 +370,8 @@ class PegAndRing(Dataset):
                         "frames_indexes": frame_idxs,
                         "phase_label": phase_last,
                         "phase_label_dense": phase_dense,
-                        "time_to_next_phase_dense": gts_window.T,  # [6,T]
-                        "time_to_next_phase": gts_window[-1],  # [6]
+                        "time_to_next_phase_dense": gts_window.T,
+                        "time_to_next_phase": gts_window[-1],
                         "future_targets": torch.zeros(
                             self.seq_len, 1, NUM_CLASSES, dtype=torch.long
                         ),
@@ -422,25 +379,30 @@ class PegAndRing(Dataset):
                 )
                 self.windows.append(window)
 
-        # final flat index (for completeness/debug)
         self.index = [
             (w["video_name"], Path(self.root / f"{w['video_name']}_1fps"), Path(fp), li)
             for w in self.windows
             for fp, li in zip(w["frames_filepath"], w["frames_indexes"])
         ]
 
+        # --- New: mapping windows -> by video for samplers ---
+        self.video_names: List[str] = [vn for vn, *_ in entries]
+        self.windows_by_video: Dict[str, List[int]] = {}
+        for wi, w in enumerate(self.windows):
+            self.windows_by_video.setdefault(w["video_name"], []).append(wi)
+
+        # Ensure per-video window indices are in ascending temporal order
+        for vn in self.windows_by_video:
+            self.windows_by_video[vn].sort()
+
     def _build_and_cache_unit_matrix(
         self,
-        ant_raw: np.ndarray,  # (N,6) ints: 0 (during), L (after), distance-in-frames (before)
+        ant_raw: np.ndarray,
         cache_path: Path,
         fps: float,
         total_frames: int,
         n_1fps: int,
     ) -> np.ndarray:
-        """
-        Convert raw anticipation to requested unit for each 1fps frame and cache it.
-        No clipping; unit is seconds or minutes only.
-        """
         L = total_frames - 1
         rows = []
         for i in range(n_1fps):
@@ -454,11 +416,8 @@ class PegAndRing(Dataset):
                 if v == 0:
                     secs[k] = 0.0
                 elif v == L:
-                    # time to the video end (in seconds) from this frame
-                    # secs[k] = max(0.0, (L - src_idx) / max(fps, 1e-9))
                     secs[k] = L
                 else:
-                    # v is a distance-in-frames to the next occurrence
                     secs[k] = max(0.0, float(v) / max(fps, 1e-9))
 
             vals = secs / 60.0 if self.time_unit == "minutes" else secs
@@ -474,29 +433,24 @@ class PegAndRing(Dataset):
     def __getitem__(self, idx: int):
         meta = copy.deepcopy(self.windows[idx])
 
-        # frames tensor [T,3,H,W]
         frames = torch.stack(
             [
                 self.transform(Image.open(f).convert("RGB"))
                 for f in meta["frames_filepath"]
             ],
             dim=0,
-        )
+        ).contiguous()
 
-        # canonical dtypes (no None)
         meta["frames_indexes"] = torch.asarray(meta["frames_indexes"], dtype=torch.long)
-        meta["phase_label"] = torch.asarray(meta["phase_label"], dtype=torch.long)
+        meta["phase_label"] = torch.asarray(meta["phase_label"], dtype=torch.float32)
         meta["phase_label_dense"] = torch.asarray(
-            meta["phase_label_dense"], dtype=torch.long
+            meta["phase_label_dense"], dtype=torch.float32
         )
-        meta["time_to_next_phase_dense"] = np.asarray(
-            meta["time_to_next_phase_dense"], dtype=np.float32
+        meta["time_to_next_phase_dense"] = torch.from_numpy(
+            meta["time_to_next_phase_dense"]
         )
-        meta["time_to_next_phase"] = np.asarray(
-            meta["time_to_next_phase"], dtype=np.float32
-        )
+        meta["time_to_next_phase"] = torch.from_numpy(meta["time_to_next_phase"])
 
-        # optional depths
         if (
             self.rgbd_mode
             and ("frames_depths" in meta)
@@ -508,35 +462,226 @@ class PegAndRing(Dataset):
                     for fp in meta["frames_depths"]
                 ],
                 dim=0,
-            )  # [T,H,W]
-            depths = self.rgbd_transform(depths.unsqueeze(1)).squeeze(1)  # [T,H,W]
+            )
+            depths = self.rgbd_transform(depths.unsqueeze(1)).squeeze(1)
             meta["depths"] = depths
             if self.add_depth_to_frames:
-                frames_rgbd = torch.cat(
-                    (frames, depths.unsqueeze(1)), dim=1
-                )  # [T,4,H,W]
+                frames_rgbd = torch.cat((frames, depths.unsqueeze(1)), dim=1)
                 meta["frames_rgbd"] = frames_rgbd
 
         return frames, meta
 
 
+# ------------------- New: Samplers that shuffle videos, not windows -------------------
+
+
+class VideoSequentialSampler(Sampler[int]):
+    """
+    Yields dataset indices grouped by video. Within a video, indices are yielded in order.
+    The *order of videos* is shuffled each epoch if shuffle_videos=True.
+    """
+
+    def __init__(
+        self,
+        dataset: PegAndRing,
+        shuffle_videos: bool = True,
+        generator: Optional[torch.Generator] = None,
+    ):
+        self.dataset = dataset
+        self.shuffle_videos = shuffle_videos
+        self.generator = generator
+
+        self.video_list: List[str] = list(dataset.windows_by_video.keys())
+
+    def __iter__(self) -> Iterator[int]:
+        g = self.generator if self.generator is not None else torch.Generator()
+        order = list(range(len(self.video_list)))
+        if self.shuffle_videos:
+            perm = torch.randperm(len(order), generator=g).tolist()
+            order = [order[i] for i in perm]
+
+        for oi in order:
+            vn = self.video_list[oi]
+            for idx in self.dataset.windows_by_video[vn]:
+                yield idx
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+
+class VideoBatchSampler(BatchSampler):
+    """
+    Batch sampler that:
+      - Shuffles the order of videos per epoch (if shuffle_videos=True),
+      - Emits batches that NEVER cross video boundaries,
+      - Within each video, windows are in order.
+    Two modes:
+      1) Fixed-size batches: provide batch_size (int). Remainders optionally dropped via drop_last.
+      2) One-video-per-batch: set batch_size=None and batch_videos=True (variable batch sizes).
+    """
+
+    def __init__(
+        self,
+        dataset: PegAndRing,
+        batch_size: Optional[int] = None,
+        drop_last: bool = False,
+        shuffle_videos: bool = True,
+        generator: Optional[torch.Generator] = None,
+        batch_videos: bool = False,
+    ):
+        if batch_videos and batch_size is not None:
+            raise ValueError("Set either batch_videos=True OR batch_size (not both).")
+        if not batch_videos and (batch_size is None):
+            raise ValueError("Provide batch_size when batch_videos=False.")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle_videos = shuffle_videos
+        self.generator = generator
+        self.batch_videos = batch_videos
+
+        self.video_list: List[str] = list(dataset.windows_by_video.keys())
+
+    def __iter__(self) -> Iterator[List[int]]:
+        g = self.generator if self.generator is not None else torch.Generator()
+        order = list(range(len(self.video_list)))
+        if self.shuffle_videos:
+            perm = torch.randperm(len(order), generator=g).tolist()
+            order = [order[i] for i in perm]
+
+        for oi in order:
+            vn = self.video_list[oi]
+            inds = self.dataset.windows_by_video[vn]
+
+            if self.batch_videos:
+                yield list(inds)
+            else:
+                # Fixed-size batches within the video
+                bs = int(self.batch_size)
+                for start in range(0, len(inds), bs):
+                    batch = inds[start : start + bs]
+                    if len(batch) == bs:
+                        yield batch
+                    else:
+                        if not self.drop_last and len(batch) > 0:
+                            yield batch
+
+    def __len__(self) -> int:
+        if self.batch_videos:
+            return len(self.video_list)
+        # Approximate (depends on per-video remainder handling)
+        count = 0
+        bs = int(self.batch_size)
+        for vn in self.video_list:
+            n = len(self.dataset.windows_by_video[vn])
+            q, r = divmod(n, bs)
+            count += q + (0 if (self.drop_last or r == 0) else 1)
+        return count
+
+
+# -------------------------------------------------------------------------------------
+
 if __name__ == "__main__":
-
-    _show_plot()
-
     ds_train = PegAndRing(
         root_dir="data/peg_and_ring_workflow",
         mode="train",
         seq_len=16,
         stride=1,
-        time_unit="minutes",  # default (omit to use minutes)
+        time_unit="minutes",
     )
     print("train windows:", len(ds_train))
-    for i in range(len(ds_train)):
-        data = ds_train[i]
 
-        print(f"  window {i}: {data}")
+    from torch.utils.data import DataLoader
 
+    """
+    # -------- Standard (default) mode: shuffle all windows --------
+    dataloader_std = DataLoader(
+        ds_train,
+        batch_size=32,
+        shuffle=True,      # shuffles windows across *all videos*
+        num_workers=8,
+        pin_memory=False,
+    )
+    print("Iterating Standard DataLoader (shuffle all windows across all videos)...")
+    for i, (frames, meta) in tqdm(enumerate(dataloader_std), total=len(dataloader_std)):
+        pass
+
+    # -------- Option A: shuffle videos, fixed-size batches (may cross videos) --------
+    gen = torch.Generator()
+    gen.manual_seed(42)
+    sampler = VideoSequentialSampler(ds_train, shuffle_videos=True, generator=gen)
+    dataloader_A = DataLoader(
+        ds_train,
+        batch_size=32,
+        sampler=sampler,    # overrides shuffle
+        num_workers=8,
+        pin_memory=False,
+    )
+    print("Iterating Option A (video-shuffled order, fixed-size batches possibly crossing videos)...")
+    for i, (frames, meta) in tqdm(enumerate(dataloader_A), total=len(dataloader_A)):
+        pass
+
+    # -------- Option B1: one video per batch (variable batch sizes, no mixing) --------
+    batch_sampler_video = VideoBatchSampler(
+        ds_train,
+        batch_size=None,
+        batch_videos=True,    # one video = one batch
+        shuffle_videos=True,
+        generator=gen,
+    )
+    dataloader_B1 = DataLoader(
+        ds_train,
+        batch_sampler=batch_sampler_video,
+        num_workers=8,
+        pin_memory=False,
+    )
+    print("Iterating Option B1 (one video per batch; batches do not cross videos)...")
+    for i, (frames, meta) in tqdm(enumerate(dataloader_B1), total=len(dataloader_B1)):
+        pass
+
+    # -------- Option B2: fixed-size batches confined within a video --------
+    batch_sampler_fixed = VideoBatchSampler(
+        ds_train,
+        batch_size=32,
+        drop_last=False,
+        shuffle_videos=True,
+        generator=gen,
+        batch_videos=False,   # fixed-size batches
+    )
+    dataloader_B2 = DataLoader(
+        ds_train,
+        batch_sampler=batch_sampler_fixed,
+        num_workers=8,
+        pin_memory=False,
+    )
+    print("Iterating Option B2 (fixed-size batches that do not cross videos)...")
+    for i, (frames, meta) in tqdm(enumerate(dataloader_B2), total=len(dataloader_B2)):
+        pass
+
+    """
+    gen_train = torch.Generator()
+    gen_train.manual_seed(42)
+    train_batch_sampler_fixed = VideoBatchSampler(
+        ds_train,
+        batch_size=32,
+        drop_last=False,
+        shuffle_videos=True,
+        generator=gen_train,
+        batch_videos=False,  # fixed-size batches
+    )
+    dataloader_B2 = DataLoader(
+        ds_train,
+        batch_sampler=train_batch_sampler_fixed,
+        num_workers=8,
+        pin_memory=False,
+    )
+
+    for i, (frames, meta) in enumerate(dataloader_B2):
+        frames_idxs = meta['frames_indexes']
+        print( f"Idx: {i}, batch_len={frames.shape[0]} frames_idxs={frames_idxs} video_name={meta['video_name']}")
+
+    # ----- Validation/Test sets (for counts) -----
     ds_val = PegAndRing(
         root_dir="data/peg_and_ring_workflow",
         mode="val",
@@ -554,3 +699,45 @@ if __name__ == "__main__":
         time_unit="minutes",
     )
     print("test windows:", len(ds_test))
+
+    gen_val = torch.Generator()
+    gen_val.manual_seed(42)
+    val_batch_sampler_fixed = VideoBatchSampler(
+        ds_val,
+        batch_size=32,
+        drop_last=False,
+        shuffle_videos=True,
+        generator=gen_val,
+        batch_videos=False,  # fixed-size batches
+    )
+    dataloader_val = DataLoader(
+        ds_val,
+        batch_sampler=val_batch_sampler_fixed,
+        num_workers=8,
+        pin_memory=False,
+    )
+
+    for i, (frames, meta) in tqdm(enumerate(dataloader_val), total=len(dataloader_val)):
+        print( f"Idx: {i}, batch_len={frames.shape[0]} video_name={meta['video_name']}")
+
+    gen_test = torch.Generator()
+    gen_test.manual_seed(42)
+    test_batch_sampler_fixed = VideoBatchSampler(
+        ds_test,
+        batch_size=32,
+        drop_last=False,
+        shuffle_videos=True,
+        generator=gen_test,
+        batch_videos=False,  # fixed-size batches
+    )
+    dataloader_test = DataLoader(
+        ds_test,
+        batch_sampler=test_batch_sampler_fixed,
+        num_workers=8,
+        pin_memory=False,
+    )
+
+    for i, (frames, meta) in tqdm(
+        enumerate(dataloader_test), total=len(dataloader_test)
+    ):
+        pass

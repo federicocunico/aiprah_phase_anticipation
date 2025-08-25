@@ -5,10 +5,12 @@ import pytorch_lightning as pl
 
 
 class PhaseAnticipationTrainer(pl.LightningModule):
-    def __init__(self, model: torch.nn.Module, loss_criterion: torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, loss_criterion: torch.nn.Module, multi_task: bool = False):
         super().__init__()
         self.model: torch.nn.Module = model
         self.loss_criterion: torch.nn.Module = loss_criterion
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
+        self.multi_task = multi_task
         _, self.ax = plt.subplots(1, 1, figsize=(15, 5))
         self.min_loss = float("inf")
 
@@ -64,44 +66,33 @@ class PhaseAnticipationTrainer(pl.LightningModule):
     def _batch_mae(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         return torch.mean(torch.abs(pred - tgt))
 
+    def get_loss(self, phase_loss, anticipation_loss):
+        if self.multi_task:
+            return 0.01 * phase_loss + 1 * anticipation_loss
+        return anticipation_loss
+
     # ----------------- training -----------------
     def training_step(self, batch, batch_idx):
         frames, metadata = batch
         labels = metadata["phase_label"]
         time_to_next_phase = torch.clamp(metadata["time_to_next_phase"], 0, self.model.time_horizon)  # [B, C]
 
-        outputs = self.model(frames)
-        parsed = self._parse_outputs(outputs)
+        outputs: torch.Tensor = self.model(frames)  # [B, C]
+        predicted_class = outputs.argmin(dim=1).float()
 
-        # compute loss for the three cases
-        if parsed["anticipated"] is not None:  # (current, anticipated)
-            loss, loss_phase, loss_anticipation = self.loss_criterion(
-                parsed["current"], parsed["anticipated"], labels, time_to_next_phase
-            )
-        elif isinstance(outputs, torch.Tensor):  # regression only (normalized head)
-            reg_norm = outputs / self.model.time_horizon
-            tgt_norm = time_to_next_phase / self.model.time_horizon
-            loss = self.loss_criterion(reg_norm, tgt_norm)
-            loss_phase = torch.tensor(0.0, device=loss.device)
-            loss_anticipation = loss
-        else:  # (current, future?, regression)
-            loss_dict = self.loss_criterion(
-                parsed["current"], parsed["future"], parsed["reg"],
-                labels, metadata["future_targets"], time_to_next_phase
-            )
-            loss = loss_dict["total_loss"]
-            loss_phase = loss_dict["classification_loss"]
-            loss_anticipation = loss_dict["regression_loss"]
+        phase_loss = self.cross_entropy_loss(predicted_class, labels)
+        anticipation_loss = self.loss_criterion(outputs, time_to_next_phase)
+
+        train_loss = self.get_loss(phase_loss, anticipation_loss)
 
         with torch.no_grad():
-            # bring predictions to same unit (sec/min)
-            pred_times = self._pred_times_same_unit(outputs, time_to_next_phase)
-            train_mae = self._batch_mae(pred_times, time_to_next_phase)
+            train_mae = self._batch_mae(outputs, time_to_next_phase)
 
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_loss_anticipation", loss_anticipation)
+        self.log("train_loss", train_loss, prog_bar=True)
+        self.log("train_loss_anticipation", anticipation_loss)
+        self.log("phase_loss", phase_loss)
         self.log("train_mae", train_mae, prog_bar=True)
-        return loss
+        return train_loss
 
     # ----------------- validation -----------------
     def on_validation_epoch_start(self):
@@ -113,44 +104,28 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         labels = metadata["phase_label"]
         time_to_next_phase = torch.clamp(metadata["time_to_next_phase"], 0, self.model.time_horizon)
 
-        outputs = self.model(frames)
-        parsed = self._parse_outputs(outputs)
+        outputs: torch.Tensor = self.model(frames)
+        predicted_class = outputs.argmin(dim=1).float()
 
-        if parsed["anticipated"] is not None:
-            loss, loss_phase, loss_anticipation = self.loss_criterion(
-                parsed["current"], parsed["anticipated"], labels, time_to_next_phase
-            )
-            _, predicted = torch.max(parsed["current"], 1)
-        elif isinstance(outputs, torch.Tensor):
-            reg_norm = outputs / self.model.time_horizon
-            tgt_norm = time_to_next_phase / self.model.time_horizon
-            loss = self.loss_criterion(reg_norm, tgt_norm)
-            loss_phase = torch.tensor(0.0, device=loss.device)
-            loss_anticipation = loss
-            predicted = torch.argmin(outputs, dim=1)
-        else:
-            loss_dict = self.loss_criterion(
-                parsed["current"], parsed["future"], parsed["reg"],
-                labels, metadata["future_targets"], time_to_next_phase
-            )
-            loss = loss_dict["total_loss"]
-            loss_phase = loss_dict["classification_loss"]
-            loss_anticipation = loss_dict["regression_loss"]
-            _, predicted = torch.max(parsed["current"], 1)
+        phase_loss = self.cross_entropy_loss(predicted_class, labels)
+        anticipation_loss = self.loss_criterion(outputs, time_to_next_phase)
+
+        val_loss = self.get_loss(phase_loss, anticipation_loss)
 
         self.val_y_true.extend(labels.detach().cpu().tolist())
-        self.val_y_pred.extend(predicted.detach().cpu().tolist())
+        self.val_y_pred.extend(predicted_class.detach().cpu().tolist())
 
         with torch.no_grad():
-            pred_times = self._pred_times_same_unit(outputs, time_to_next_phase)
-            val_mae = self._batch_mae(pred_times, time_to_next_phase)
+            val_mae = self._batch_mae(outputs, time_to_next_phase)
             # store per-frame averages (mean over classes) for plotting
             self.val_y_true_regr.extend(time_to_next_phase.mean(dim=1).detach().cpu().tolist())
-            self.val_y_pred_regr.extend(pred_times.mean(dim=1).detach().cpu().tolist())
+            self.val_y_pred_regr.extend(outputs.mean(dim=1).detach().cpu().tolist())
 
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", val_loss, prog_bar=True)
+        self.log("val_loss_anticipation", anticipation_loss)
+        self.log("val_loss_phase", phase_loss)
         self.log("val_mae", val_mae, prog_bar=True)
-        return loss
+        return val_loss
 
     def on_validation_epoch_end(self):
         acc = accuracy_score(self.val_y_true, self.val_y_pred)
@@ -185,45 +160,27 @@ class PhaseAnticipationTrainer(pl.LightningModule):
         labels = metadata["phase_label"]
         time_to_next_phase = torch.clamp(metadata["time_to_next_phase"], 0, self.model.time_horizon)
 
-        outputs = self.model(frames)
-        parsed = self._parse_outputs(outputs)
+        outputs: torch.Tensor = self.model(frames)
+        predicted_class = outputs.argmin(dim=1).float()
 
-        if parsed["anticipated"] is not None:
-            loss, loss_phase, loss_anticipation = self.loss_criterion(
-                parsed["current"], parsed["anticipated"], labels, time_to_next_phase
-            )
-            logits_for_cls = parsed["current"]
-        elif isinstance(outputs, torch.Tensor):
-            reg_norm = outputs / self.model.time_horizon
-            tgt_norm = time_to_next_phase / self.model.time_horizon
-            loss = self.loss_criterion(reg_norm, tgt_norm)
-            loss_phase = torch.tensor(0.0, device=loss.device)
-            loss_anticipation = loss
-            # fabricate a phase prediction as argmin over predicted times (pre-scale ok)
-            logits_for_cls = -outputs  # smaller time -> larger "logit"
-        else:
-            loss_dict = self.loss_criterion(
-                parsed["current"], parsed["future"], parsed["reg"],
-                labels, metadata["future_targets"], time_to_next_phase
-            )
-            loss = loss_dict["total_loss"]
-            loss_phase = loss_dict["classification_loss"]
-            loss_anticipation = loss_dict["regression_loss"]
-            logits_for_cls = parsed["current"]
+        phase_loss = self.cross_entropy_loss(predicted_class, labels)
+        anticipation_loss = self.loss_criterion(outputs, time_to_next_phase)
 
-        _, predicted = torch.max(logits_for_cls, 1)
+        test_loss = self.get_loss(phase_loss, anticipation_loss)
+
         self.test_y_true.extend(labels.detach().cpu().tolist())
-        self.test_y_pred.extend(predicted.detach().cpu().tolist())
+        self.test_y_pred.extend(predicted_class.detach().cpu().tolist())
 
         with torch.no_grad():
-            pred_times = self._pred_times_same_unit(outputs, time_to_next_phase)
-            test_mae = self._batch_mae(pred_times, time_to_next_phase)
+            test_mae = self._batch_mae(outputs, time_to_next_phase)
             self.test_y_true_regr.extend(time_to_next_phase.mean(dim=1).detach().cpu().tolist())
-            self.test_y_pred_regr.extend(pred_times.mean(dim=1).detach().cpu().tolist())
+            self.test_y_pred_regr.extend(outputs.mean(dim=1).detach().cpu().tolist())
 
-        self.log("test_loss", loss, prog_bar=True)
+        self.log("test_loss", test_loss, prog_bar=True)
+        self.log("test_loss_anticipation", anticipation_loss)
+        self.log("test_loss_phase", phase_loss)
         self.log("test_mae", test_mae, prog_bar=True)
-        return loss
+        return test_loss
 
     def on_test_epoch_end(self):
         acc = accuracy_score(self.test_y_true, self.test_y_pred)
