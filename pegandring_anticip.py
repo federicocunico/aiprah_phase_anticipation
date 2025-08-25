@@ -1,4 +1,7 @@
+#!/usr/bin/env python3
+# train_temporal_transformer_plain.py
 import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import time
@@ -15,44 +18,35 @@ from torch.utils.data import DataLoader, BatchSampler
 
 import matplotlib.pyplot as plt
 
-from datasets.peg_and_ring_workflow import PegAndRing, VideoBatchSampler
+from datasets.peg_and_ring_workflow import PegAndRing  # your dataset
+
+# from models.temporal_transformer import TemporalTransformerLearnedPE as PlainModel
 from models.temporal_windowed_transformer import WindowMemoryTransformer
 
+
 # ---------------------------
-# Starter config (tuned for 1 FPS)
+# Fixed training hyperparams
 # ---------------------------
 SEED = 42
 ROOT_DIR = "data/peg_and_ring_workflow"
-TIME_UNIT = "minutes"
+TIME_UNIT = "minutes"  # dataset outputs in minutes (or "seconds")
 NUM_CLASSES = 6
 
 # Temporal windowing
-SEQ_LEN = 16          # was 10; more temporal context helps stability at 1 FPS
-STRIDE = SEQ_LEN//2
+SEQ_LEN = 10
+STRIDE = 1
 
 # Batching / epochs
-BATCH_SIZE = 32       # requested
+BATCH_SIZE = 24
 NUM_WORKERS = 30
-EPOCHS = 40           # give cosine enough room
+EPOCHS = 20
 
-# Optimizer (group LRs used below; LR here is ignored)
+# Optimizer
 LR = 1e-4
-WEIGHT_DECAY = 5e-2   # slightly higher wd improves generalization for ViT-like heads
+WEIGHT_DECAY = 1e-4
 
 # Model hyper
-TIME_HORIZON = 2.0
-D_MODEL = 384
-NHEAD = 6
-ENC_LAYERS = 4
-DEC_LAYERS = 1
-FFN = 1536
-DROPOUT = 0.10
-REASONING_TIME = 8    # ~8 windows ≈ 8 seconds of per-video memory
-
-# Scheduler (warmup + cosine)
-WARMUP_EPOCHS = 5
-ETA_MIN = 1e-6
-CLIP_NORM = 1.0
+TIME_HORIZON = 2.0  # clamp targets/preds for stability in plots/metrics
 
 PRINT_EVERY = 20
 CKPT_PATH = Path("best_temporal_transformer_plain.pth")
@@ -115,7 +109,7 @@ def evaluate(
 
 
 # ---------------------------
-# Visualizations (kept as-is)
+# Visualizations (plain model)
 # ---------------------------
 @torch.no_grad()
 def visualize_phase_timelines_classification(
@@ -134,13 +128,14 @@ def visualize_phase_timelines_classification(
         root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit
     )
 
+    # Fixed-size batches, per-video temporal order, deterministic video order
     gen = torch.Generator()
     gen.manual_seed(SEED)
     batch_sampler = VideoBatchSampler(
         ds,
-        batch_size=batch_size,
-        batch_videos=False,
-        shuffle_videos=False,
+        batch_size=batch_size,  # <-- always use a fixed batch size
+        batch_videos=False,  # <-- never set True (no batch_size=None)
+        shuffle_videos=False,  # keep original video order for plotting
         generator=gen,
     )
     loader = DataLoader(
@@ -232,13 +227,14 @@ def visualize_anticipation_curves(
         root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit
     )
 
+    # Fixed-size batches, per-video temporal order, deterministic video order
     gen = torch.Generator()
     gen.manual_seed(SEED)
     batch_sampler = VideoBatchSampler(
         ds,
-        batch_size=batch_size,
-        batch_videos=False,
-        shuffle_videos=False,
+        batch_size=batch_size,  # <-- always use a fixed batch size
+        batch_videos=False,  # <-- never set True (no batch_size=None)
+        shuffle_videos=False,  # deterministic video order for clean curves
         generator=gen,
     )
     loader = DataLoader(
@@ -296,6 +292,7 @@ def visualize_anticipation_curves(
                 x,
                 arr[:, i],
                 linestyle="-",
+                color="blue",
                 label="Predicted",
                 linewidth=2,
             )
@@ -303,6 +300,7 @@ def visualize_anticipation_curves(
                 x,
                 gt[:, i],
                 linestyle="--",
+                color="red",
                 label="Ground Truth",
                 linewidth=2,
             )
@@ -328,79 +326,10 @@ def visualize_anticipation_curves(
         print(f"[OK] Saved anticipation curves -> {out_path}")
 
 
-# ---------------------------
-# Helper: create optimizer with param groups
-# ---------------------------
-def build_optimizer(model: WindowMemoryTransformer):
-    # Backbone vs the rest (different learning rates)
-    backbone_params, non_backbone_params = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        (backbone_params if n.startswith("backbone.") else non_backbone_params).append(p)
-
-    param_groups = [
-        {"params": backbone_params, "lr": 1e-4, "weight_decay": WEIGHT_DECAY},
-        {"params": non_backbone_params, "lr": 3e-4, "weight_decay": WEIGHT_DECAY},
-    ]
-    return optim.AdamW(param_groups)
-
-
-def linear_warmup_step(opt: optim.Optimizer, base_lrs: List[float], epoch: int, warmup_epochs: int):
-    """Scale each param group lr linearly during warmup."""
-    scale = float(epoch + 1) / float(max(1, warmup_epochs))
-    for pg, base in zip(opt.param_groups, base_lrs):
-        pg["lr"] = base * scale
-
-
-def get_base_lrs(opt: optim.Optimizer) -> List[float]:
-    return [pg["lr"] for pg in opt.param_groups]
-
-
-def unfreeze_backbone_last_block(model: WindowMemoryTransformer):
-    """Unfreeze backbone.layer4 after warmup to increase learning capacity."""
-    if hasattr(model, "backbone") and hasattr(model.backbone, "layer4"):
-        for p in model.backbone.layer4.parameters():
-            p.requires_grad = True
-
-
 def main():
-    RUN_DEMO_ONLY = False  # set True to run the tiny CPU sanity demo and exit
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
-
-    # ---------------------------
-    # Tiny CPU sanity demo (optional)
-    # ---------------------------
-    if RUN_DEMO_ONLY:
-        m = WindowMemoryTransformer(
-            sequence_length=SEQ_LEN,
-            num_classes=NUM_CLASSES,
-            time_horizon=TIME_HORIZON,
-            backbone="resnet18",
-            pretrained_backbone=False,
-            freeze_backbone=False,
-            d_model=256,
-            nhead=4,
-            num_encoder_layers=2,
-            num_decoder_layers=1,
-            dim_feedforward=512,
-            dropout=0.1,
-            reasoning_time=3,
-            prior_mode="hard",
-            reg_activation="softplus",
-        ).cpu().train()
-        x = torch.randn(2, SEQ_LEN, 3, 224, 224)
-        meta = {
-            "video_name": ["video01", "video01"],
-            "frames_indexes": torch.stack([torch.arange(0, SEQ_LEN), torch.arange(SEQ_LEN, 2*SEQ_LEN)], dim=0),
-            "phase_label": torch.randint(0, NUM_CLASSES, (2,)),
-            "time_to_next_phase": torch.rand(2, NUM_CLASSES),
-        }
-        y_reg, y_logits = m(x, meta)
-        print("Sanity demo shapes:", y_reg.shape, y_logits.shape)
-        return
 
     # ---------------------------
     # Datasets
@@ -447,7 +376,7 @@ def main():
         pin_memory=False,
     )
 
-    # For validation and test: fixed-size batches, deterministic video order
+    # For validation and test: one video per batch, deterministic order
     gen_eval = torch.Generator()
     gen_eval.manual_seed(SEED)
     val_batch_sampler = VideoBatchSampler(
@@ -479,7 +408,7 @@ def main():
     )
 
     # ---------------------------
-    # Model (starter config)
+    # Model (plain)
     # ---------------------------
     model = WindowMemoryTransformer(
         sequence_length=SEQ_LEN,
@@ -487,132 +416,107 @@ def main():
         time_horizon=TIME_HORIZON,
         backbone="resnet50",
         pretrained_backbone=True,
-        freeze_backbone=True,      # freeze during warmup for stability
-        d_model=D_MODEL,
-        nhead=NHEAD,
-        num_encoder_layers=ENC_LAYERS,
-        num_decoder_layers=DEC_LAYERS,
-        dim_feedforward=FFN,
-        dropout=DROPOUT,
-        reasoning_time=REASONING_TIME,
+        freeze_backbone=False,
+        d_model=256,
+        nhead=4,
+        num_encoder_layers=2,
+        num_decoder_layers=2,
+        dim_feedforward=512,
+        dropout=0.1,
+        reasoning_time=10,  # M * SEQ_LEN seconds
         prior_mode="hard",
-        reg_activation="softplus",
+        reg_activation="softplus",  # or "linear"
     ).to(device)
 
     # ---------------------------
-    # Losses / Optim / Scheduler (warmup + cosine)
+    # Losses / Optim
     # ---------------------------
     smooth_l1 = nn.SmoothL1Loss(reduction="mean")
     ce_loss = nn.CrossEntropyLoss()
-
-    optimizer = build_optimizer(model)
-    base_lrs = get_base_lrs(optimizer)  # [backbone_lr, head_lr]
-    cosine = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, EPOCHS - WARMUP_EPOCHS), eta_min=ETA_MIN
-    )
-
-    def step_scheduler(epoch_idx: int):
-        if epoch_idx < WARMUP_EPOCHS:
-            linear_warmup_step(optimizer, base_lrs, epoch_idx, WARMUP_EPOCHS)
-        else:
-            cosine.step()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     # ---------------------------
     # Training loop
     # ---------------------------
     best_val_mae = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        epoch_mae = 0.0
-        epoch_ce = 0.0
-        epoch_loss = 0.0
-        epoch_acc = 0.0
-        seen = 0
+    if True:
+        for epoch in range(1, EPOCHS + 1):
+            model.train()
+            epoch_mae = 0.0
+            epoch_ce = 0.0
+            epoch_loss = 0.0
+            epoch_acc = 0.0
+            seen = 0
 
-        t0 = time.time()
-        model.reset_all_memory()
+            t0 = time.time()
+            model.reset_all_memory()
 
-        # Unfreeze backbone's last block right after warmup (once)
-        if epoch == WARMUP_EPOCHS + 1:
-            unfreeze_backbone_last_block(model)
-            # re-build optimizer to include newly trainable params (keep current lrs)
-            optimizer = build_optimizer(model)
-            base_lrs = get_base_lrs(optimizer)
-            # resume cosine starting where we left off (epoch-1 warmup steps already done)
-            cosine = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(1, EPOCHS - WARMUP_EPOCHS), eta_min=ETA_MIN
-            )
-
-        for it, (frames, meta) in enumerate(train_loader, start=1):
-            frames = frames.to(device)  # [B, T, 3, H, W]
-            labels = meta["phase_label"].to(device).long()
-            ttnp = torch.clamp(
-                meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON
-            )
-
-            reg, logits = model(frames, meta)
-
-            phase_loss = ce_loss(logits, labels)
-            anticipation_loss = smooth_l1(reg, ttnp)
-            train_loss = anticipation_loss + phase_loss
-
-            optimizer.zero_grad(set_to_none=True)
-            train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
-            optimizer.step()
-
-            with torch.no_grad():
-                pred_cls = logits.argmax(dim=1)
-                train_mae = torch.mean(torch.abs(reg - ttnp))
-                train_acc = (pred_cls == labels).float().mean()
-
-            bs = frames.size(0)
-            epoch_mae += float(train_mae.item()) * bs
-            epoch_ce += float(phase_loss.item()) * bs
-            epoch_loss += float(train_loss.item()) * bs
-            epoch_acc += float(train_acc.item()) * bs
-            seen += bs
-
-            if it % PRINT_EVERY == 0:
-                lrs = [pg["lr"] for pg in optimizer.param_groups]
-                print(
-                    f"[Epoch {epoch:02d} | it {it:04d}] "
-                    f"loss={train_loss.item():.4f} | mae={train_mae.item():.4f} | "
-                    f"acc={train_acc.item():.4f} | reg={anticipation_loss.item():.4f} | "
-                    f"cls={phase_loss.item():.4f} | lrs={lrs}"
+            for it, (frames, meta) in enumerate(train_loader, start=1):
+                frames = frames.to(device)  # [B, T, 3, H, W]
+                labels = meta["phase_label"].to(device).long()
+                ttnp = torch.clamp(
+                    meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON
                 )
 
-        # Step scheduler per-epoch
-        step_scheduler(epoch - 1)
+                reg, logits, aux = model.forward(frames, meta, return_aux=True)
 
-        # Epoch stats
-        train_loss_avg = epoch_loss / max(1, seen)
-        train_mae_avg = epoch_mae / max(1, seen)
-        train_ce_avg = epoch_ce / max(1, seen)
-        train_acc_avg = epoch_acc / max(1, seen)
-        print(
-            f"\nEpoch {epoch:02d} [{time.time()-t0:.1f}s] "
-            f"| train_loss={train_loss_avg:.4f} train_mae={train_mae_avg:.4f} "
-            f"train_ce={train_ce_avg:.4f} train_acc={train_acc_avg:.4f}"
-        )
+                phase_loss = ce_loss(logits, labels)
+                anticipation_loss = smooth_l1(reg, ttnp)
+                train_loss = anticipation_loss + phase_loss
 
-        # ---------------------------
-        # Validation
-        # ---------------------------
-        val_stats = evaluate(model, val_loader, device, TIME_HORIZON)
-        print(
-            f"           val_mae={val_stats['mae']:.4f} val_ce={val_stats['ce']:.4f} "
-            f"val_acc={val_stats['acc']:.4f} | samples={val_stats['samples']}"
-        )
+                optimizer.zero_grad(set_to_none=True)
+                train_loss.backward()
+                optimizer.step()
 
-        if val_stats["mae"] < best_val_mae:
-            best_val_mae = val_stats["mae"]
-            torch.save(model.state_dict(), CKPT_PATH)
-            print(f"✅  New best val_mae={best_val_mae:.4f} — saved to: {CKPT_PATH}")
+                with torch.no_grad():
+                    pred_cls = logits.argmax(dim=1)
+                    train_mae = torch.mean(torch.abs(reg - ttnp))
+                    train_acc = (pred_cls == labels).float().mean()
+
+                bs = frames.size(0)
+                epoch_mae += float(train_mae.item()) * bs
+                epoch_ce += float(phase_loss.item()) * bs
+                epoch_loss += float(train_loss.item()) * bs
+                epoch_acc += float(train_acc.item()) * bs
+                seen += bs
+
+                if it % PRINT_EVERY == 0:
+                    print(
+                        f"[Epoch {epoch:02d} | it {it:04d}] "
+                        f"loss={train_loss.item():.4f} | mae={train_mae.item():.4f} | "
+                        f"acc={train_acc.item():.4f} | reg={anticipation_loss.item():.4f} | "
+                        f"cls={phase_loss.item():.4f}"
+                    )
+
+            train_loss_avg = epoch_loss / max(1, seen)
+            train_mae_avg = epoch_mae / max(1, seen)
+            train_ce_avg = epoch_ce / max(1, seen)
+            train_acc_avg = epoch_acc / max(1, seen)
+            print(
+                f"\nEpoch {epoch:02d} [{time.time()-t0:.1f}s] "
+                f"| train_loss={train_loss_avg:.4f} train_mae={train_mae_avg:.4f} "
+                f"train_ce={train_ce_avg:.4f} train_acc={train_acc_avg:.4f}"
+            )
+
+            # ---------------------------
+            # Validation
+            # ---------------------------
+            val_stats = evaluate(model, val_loader, device, TIME_HORIZON)
+            print(
+                f"           val_mae={val_stats['mae']:.4f} val_ce={val_stats['ce']:.4f} "
+                f"val_acc={val_stats['acc']:.4f} | samples={val_stats['samples']}"
+            )
+
+            if val_stats["mae"] < best_val_mae:
+                best_val_mae = val_stats["mae"]
+                torch.save(model.state_dict(), CKPT_PATH)
+                print(
+                    f"✅  New best val_mae={best_val_mae:.4f} — saved to: {CKPT_PATH}"
+                )
 
     # ---------------------------
-    # Test + Visualizations (unchanged)
+    # Test + Visualizations
     # ---------------------------
     if CKPT_PATH.exists():
         model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
