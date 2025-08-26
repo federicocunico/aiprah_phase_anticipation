@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
-# train_temporal_transformer_plain.py
+# train_future_anticipation_transformer.py
 import os
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import time
 import random
 from pathlib import Path
-from typing import Dict, Any, DefaultDict, Optional, List, Iterator
+from typing import Dict, Any, DefaultDict, Optional, List, Tuple, Literal
 from collections import defaultdict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, BatchSampler
+from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
 
-from datasets.peg_and_ring_workflow import PegAndRing, VideoBatchSampler  # your dataset
-from typing import Tuple, Dict, Any, Optional, Literal, List
-import math
+from datasets.peg_and_ring_workflow import PegAndRing, VideoBatchSampler
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Any, Optional, Tuple, List
+import math
 
 # ---- backbone (torchvision) ----
 try:
@@ -35,244 +33,406 @@ except Exception:
     _HAS_TORCHVISION_WEIGHTS_ENUM = False
 
 
-# ---------- helpers ----------
-def rowmin_zero_hard(y: torch.Tensor, H: float) -> torch.Tensor:
-    # ensure ≥ 1 zero per row, clamp to [0, H]
-    return torch.clamp(y - y.min(dim=1, keepdim=True).values, 0.0, H)
-
-
-class LayerNorm1d(nn.Module):
-    """LayerNorm over channel dim for 1D sequences (B, C, T)."""
-    def __init__(self, num_channels: int, eps: float = 1e-5):
-        super().__init__()
-        self.ln = nn.LayerNorm(num_channels, eps=eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x:[B,C,T]
-        x = x.transpose(1, 2)     # [B,T,C]
-        x = self.ln(x)
-        return x.transpose(1, 2)  # [B,C,T]
-
-
 class TemporalConvBlock(nn.Module):
     """
-    Dilated temporal conv with residual:
-      Conv1d(C,C, ks=3, dilation=d, padding=d) -> GELU -> Dropout -> Conv1d -> GELU -> Dropout -> +res -> Norm
+    Temporal convolutional block with residual connection and causal padding.
+    Uses dilated convolutions for different receptive fields.
     """
-    def __init__(self, channels: int, dilation: int, dropout: float = 0.1):
+    def __init__(
+        self, 
+        in_channels: int, 
+        out_channels: int, 
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.1,
+        use_residual: bool = True
+    ):
         super().__init__()
-        pad = dilation
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=pad, dilation=dilation)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=pad, dilation=dilation)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-        self.norm = LayerNorm1d(channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x:[B,C,T]
-        res = x
+        
+        self.use_residual = use_residual and (in_channels == out_channels)
+        
+        # Causal padding - only look at past and present
+        self.pad = (kernel_size - 1) * dilation
+        
+        self.conv1 = nn.Conv1d(
+            in_channels, out_channels, 
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=0  # We'll handle padding manually for causality
+        )
+        
+        self.conv2 = nn.Conv1d(
+            out_channels, out_channels,
+            kernel_size=1  # Pointwise conv
+        )
+        
+        self.norm1 = nn.BatchNorm1d(out_channels)
+        self.norm2 = nn.BatchNorm1d(out_channels)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+        
+        # Residual connection projection if needed
+        if in_channels != out_channels:
+            self.residual_proj = nn.Conv1d(in_channels, out_channels, 1)
+        else:
+            self.residual_proj = None
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, C, T]
+        """
+        residual = x
+        
+        # Causal padding - pad only the left side
+        if self.pad > 0:
+            x = F.pad(x, (self.pad, 0))
+        
+        # First conv with dilation
         x = self.conv1(x)
-        x = self.act(x)
-        x = self.drop(x)
+        x = self.norm1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        
+        # Pointwise conv
         x = self.conv2(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = x + res
-        x = self.norm(x)
+        x = self.norm2(x)
+        
+        # Residual connection
+        if self.use_residual:
+            if self.residual_proj is not None:
+                residual = self.residual_proj(residual)
+            x = x + residual
+        
+        x = self.activation(x)
         return x
 
 
-class MSTCNStage(nn.Module):
-    """One stage of MS-TCN with a list of dilations, all channel-preserving."""
-    def __init__(self, channels: int, dilations: List[int], dropout: float = 0.1):
+class MultiScaleTemporalCNN(nn.Module):
+    """
+    Multi-scale temporal CNN with different dilation rates to capture
+    both short-term and long-term temporal dependencies.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 256,
+        num_layers: int = 4,
+        dropout: float = 0.1
+    ):
         super().__init__()
-        self.blocks = nn.ModuleList([TemporalConvBlock(channels, d, dropout) for d in dilations])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B,C,T]
-        for blk in self.blocks:
-            x = blk(x)
+        
+        # Different dilation rates for multi-scale modeling
+        dilations = [1, 2, 4, 8, 16][:num_layers]
+        
+        self.layers = nn.ModuleList()
+        
+        # First layer
+        self.layers.append(
+            TemporalConvBlock(
+                in_channels, hidden_channels, 
+                kernel_size=3, dilation=dilations[0], 
+                dropout=dropout, use_residual=False
+            )
+        )
+        
+        # Subsequent layers
+        for i in range(1, num_layers):
+            self.layers.append(
+                TemporalConvBlock(
+                    hidden_channels, hidden_channels,
+                    kernel_size=3, dilation=dilations[i],
+                    dropout=dropout, use_residual=True
+                )
+            )
+        
+        # Final projection
+        self.final_proj = nn.Conv1d(hidden_channels, hidden_channels, 1)
+        self.final_norm = nn.BatchNorm1d(hidden_channels)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, C, T]
+        """
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.final_proj(x)
+        x = self.final_norm(x)
+        x = F.gelu(x)
+        
         return x
 
 
-# ---------- model ----------
-class WindowMemoryTransformer(nn.Module):
+class SpatialAttentionPool(nn.Module):
     """
-    Stateless hybrid:
-      - Visual backbone per frame -> proj to D
-      - MS-TCN (2 stages, dilations [1,2,4,8]) over time
-      - [CLS] token + TransformerEncoder (global)
-      - TransformerDecoder with C class queries
-      - Heads: cls on [CLS], reg on per-class decoded vectors (+ hard row-min prior)
+    Spatial attention pooling for CNN features.
+    Instead of simple average pooling, learn what spatial regions are important.
     """
+    def __init__(self, in_channels: int):
+        super().__init__()
+        
+        # Spatial attention
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 8, 1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // 8, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        # Global average pooling
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, C, H, W] -> [B, C]
+        """
+        # Compute spatial attention weights
+        att_weights = self.spatial_att(x)  # [B, 1, H, W]
+        
+        # Apply attention
+        x_attended = x * att_weights  # [B, C, H, W]
+        
+        # Global pooling
+        x_pooled = self.global_pool(x_attended)  # [B, C, 1, 1]
+        x_pooled = x_pooled.flatten(1)  # [B, C]
+        
+        return x_pooled
+
+
+class TemporalCNNAnticipation(nn.Module):
+    """
+    Non-transformer approach using:
+    1. Visual backbone with spatial attention pooling
+    2. Multi-scale temporal CNN for sequence modeling
+    3. Specialized heads for phase classification and anticipation
+    
+    Key advantages:
+    - Faster than transformers (especially for longer sequences)
+    - Naturally causal (no future information leakage)
+    - Good for 1fps videos with clear temporal structure
+    - Easier to interpret and debug
+    """
+    
     def __init__(
         self,
         sequence_length: int,
         num_classes: int = 6,
         time_horizon: float = 2.0,
         *,
-        backbone: str = "resnet50",            # "resnet18" | "resnet50"
+        backbone: str = "resnet18",
         pretrained_backbone: bool = True,
-        freeze_backbone: bool = True,
-        d_model: int = 384,
-        nhead: int = 6,
-        num_encoder_layers: int = 4,
-        num_decoder_layers: int = 1,
-        dim_feedforward: int = 1536,
-        dropout: float = 0.10,
-        tcn_stages: int = 2,
-        tcn_dilations: Optional[List[int]] = None,  # default [1,2,4,8]
-        reg_activation: Literal["softplus", "linear"] = "softplus",
-        prior_mode: Literal["hard", "none"] = "hard",
+        freeze_backbone: bool = False,
+        hidden_channels: int = 256,
+        num_temporal_layers: int = 5,
+        dropout: float = 0.1,
+        use_spatial_attention: bool = True,
     ):
         super().__init__()
-        assert d_model % nhead == 0
-        self.T = int(sequence_length)
-        self.C = int(num_classes)
-        self.H = float(time_horizon)
-        self.prior_mode = prior_mode
-
-        # ---- Backbone ----
+        
+        self.T = sequence_length
+        self.C = num_classes
+        self.H = time_horizon
+        self.hidden_channels = hidden_channels
+        
+        # ---- Visual Backbone ----
         if backbone == "resnet18":
             if _HAS_TORCHVISION_WEIGHTS_ENUM:
                 bb = resnet18(weights=ResNet18_Weights.DEFAULT if pretrained_backbone else None)
             else:
-                bb = torchvision.models.resnet18(pretrained=pretrained_backbone)  # type: ignore
+                bb = torchvision.models.resnet18(pretrained=pretrained_backbone)
             feat_dim = 512
         elif backbone == "resnet50":
             if _HAS_TORCHVISION_WEIGHTS_ENUM:
                 bb = resnet50(weights=ResNet50_Weights.DEFAULT if pretrained_backbone else None)
             else:
-                bb = torchvision.models.resnet50(pretrained=pretrained_backbone)  # type: ignore
+                bb = torchvision.models.resnet50(pretrained=pretrained_backbone)
             feat_dim = 2048
         else:
-            raise ValueError("Unsupported backbone")
-
-        # global pooling head replaced by Identity
-        bb.fc = nn.Identity()
-        self.backbone = bb
+            raise ValueError(f"Unsupported backbone: {backbone}")
+        
+        # Remove the final FC layer and average pooling
+        self.backbone_features = nn.Sequential(*list(bb.children())[:-2])  # Remove avgpool and fc
+        
         if freeze_backbone:
-            for p in self.backbone.parameters():
+            for p in self.backbone_features.parameters():
                 p.requires_grad = False
-
-        # ---- Visual projection to D ----
-        self.feat_proj = nn.Linear(feat_dim, d_model)
-        self.feat_norm = nn.LayerNorm(d_model)
-
-        # ---- MS-TCN over time (robust local structure) ----
-        if tcn_dilations is None:
-            tcn_dilations = [1, 2, 4, 8]
-        self.to_tcn = nn.Linear(d_model, d_model)
-        self.tcn_stages = nn.ModuleList(
-            [MSTCNStage(d_model, tcn_dilations, dropout=dropout) for _ in range(tcn_stages)]
+        
+        # ---- Spatial pooling ----
+        if use_spatial_attention:
+            self.spatial_pool = SpatialAttentionPool(feat_dim)
+        else:
+            self.spatial_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # ---- Feature projection ----
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feat_dim, hidden_channels),
+            nn.BatchNorm1d(hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
-        self.from_tcn = nn.Linear(d_model, d_model)
-
-        # ---- Transformer Encoder with [CLS] token (global) ----
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.pos_emb = nn.Embedding(self.T + 1, d_model)  # +1 for CLS
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=False, norm_first=True
+        
+        # ---- Temporal CNN ----
+        self.temporal_cnn = MultiScaleTemporalCNN(
+            in_channels=hidden_channels,
+            hidden_channels=hidden_channels,
+            num_layers=num_temporal_layers,
+            dropout=dropout
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_encoder_layers)
-
-        # ---- Class-query Transformer Decoder (per-class aggregation) ----
-        self.class_queries = nn.Parameter(torch.randn(self.C, d_model) * 0.02)
-        dec_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=False, norm_first=True
-        )
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_decoder_layers)
-
-        # ---- Heads ----
-        self.cls_head = nn.Sequential(
-            nn.LayerNorm(d_model),
+        
+        # ---- Phase classification head ----
+        # Use only the last timestep for current phase
+        self.phase_head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.BatchNorm1d(hidden_channels // 2),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, self.C),
+            nn.Linear(hidden_channels // 2, num_classes)
         )
-        if reg_activation == "softplus":
-            self.reg_head = nn.Sequential(
-                nn.Linear(d_model, 1),
-                nn.Softplus(beta=1.0),
-            )
-        else:
-            self.reg_head = nn.Linear(d_model, 1)
-
-        # ---- init ----
-        nn.init.xavier_uniform_(self.feat_proj.weight); nn.init.zeros_(self.feat_proj.bias)
-        nn.init.xavier_uniform_(self.to_tcn.weight);    nn.init.zeros_(self.to_tcn.bias)
-        nn.init.xavier_uniform_(self.from_tcn.weight);  nn.init.zeros_(self.from_tcn.bias)
-        for m in self.cls_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
-        if isinstance(self.reg_head, nn.Linear):
-            nn.init.xavier_uniform_(self.reg_head.weight); nn.init.zeros_(self.reg_head.bias)
-
-    # ---- core forward ----
-    def forward(self, frames: torch.Tensor, meta: Optional[Dict[str, Any]] = None, return_aux: bool = False
-               ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        
+        # ---- Anticipation head ----
+        # Use all timesteps with attention pooling
+        self.temporal_attention = nn.MultiheadAttention(
+            embed_dim=hidden_channels,
+            num_heads=8,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.anticipation_head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.BatchNorm1d(hidden_channels // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, num_classes),
+            nn.Softplus(beta=1.0)  # Ensure positive outputs
+        )
+        
+        # ---- Learnable query for anticipation ----
+        self.anticipation_query = nn.Parameter(
+            torch.randn(1, 1, hidden_channels) * 0.02
+        )
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights properly"""
+        for module in [self.feature_proj, self.phase_head, self.anticipation_head]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+    
+    def forward(
+        self, 
+        frames: torch.Tensor, 
+        meta: Optional[Dict[str, Any]] = None, 
+        return_aux: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        frames: [B, T, 3, H, W]
-        meta:   unused (kept for API compatibility with your trainer)
-        returns:
-          reg   : [B, C]  (clamped to [0, H], row-min prior if enabled)
-          logits: [B, C]
-          aux   : (optional) dict with debug tensors
+        Args:
+            frames: [B, T, 3, H, W] - video frames
+            meta: metadata dict (unused but kept for API compatibility)
+            return_aux: whether to return auxiliary outputs
+            
+        Returns:
+            reg: [B, C] - time to next phase for each class (anticipation)
+            logits: [B, C] - phase classification logits
+            aux: (optional) auxiliary outputs for debugging
         """
-        B, T, C3, H, W = frames.shape
-        assert T == self.T, f"Expected T={self.T}, got {T}"
-
-        # -- 1) Tokenization/patching: 2D CNN per frame --
-        x = frames.view(B * T, C3, H, W)
-        with torch.set_grad_enabled(self.backbone.training):
-            feats = self.backbone(x)              # [B*T, F]
-        feats = feats.view(B, T, -1)
-        feats = self.feat_proj(feats)             # [B,T,D]
-        feats = self.feat_norm(feats)             # normalization before temporal modules
-
-        # -- 2) Local temporal modeling: MS-TCN (dilated 1D convs) --
-        z = self.to_tcn(feats)                    # [B,T,D]
-        z = z.transpose(1, 2)                     # [B,D,T] for Conv1d
-        for stage in self.tcn_stages:
-            z = stage(z)                          # residual temporal refinement
-        z = z.transpose(1, 2)                     # [B,T,D]
-        z = self.from_tcn(z)                      # back to token space
-
-        # -- 3) Positional encodings (+ [CLS]) for global attention --
-        cls = self.cls_token.expand(-1, B, -1)    # [1,B,D]
-        pos = self.pos_emb(torch.arange(T + 1, device=z.device))  # [T+1,D]
-        src = torch.cat([cls.transpose(0, 1), z], dim=1)          # [B,T+1,D]
-        src = src.transpose(0, 1)                                  # [T+1,B,D]
-        src = src + pos.unsqueeze(1)                               # add PEs
-
-        # -- 4) Transformer Encoder (global, acausal) --
-        memory = self.encoder(src)                                 # [T+1,B,D]
-        cls_repr = memory[0]                                       # [B,D]
-        mem_no_cls = memory[1:]                                    # [T,B,D]
-
-        # -- 5) Transformer Decoder with class queries (per-class attention over time) --
-        tgt = self.class_queries.unsqueeze(1).expand(self.C, B, -1).contiguous()  # [C,B,D]
-        percls = self.decoder(tgt, mem_no_cls).transpose(0, 1)                    # [B,C,D]
-
-        # -- 6) Heads --
-        # Classification head (phase): from [CLS] representation
-        logits = self.cls_head(cls_repr)                           # [B,C]
-
-        # Regression head (anticipation): per-class vectors -> distances
-        dist = self.reg_head(percls).squeeze(-1)                   # [B,C], >=0 if softplus
-
-        # -- 7) Prior / clamping (keep outputs in [0, H]) --
-        if self.prior_mode == "hard":
-            reg = rowmin_zero_hard(dist, self.H)                   # ensure ≥1 zero per row
+        B, T, C_in, H, W = frames.shape
+        assert T == self.T, f"Expected sequence length {self.T}, got {T}"
+        
+        # ---- Extract visual features ----
+        x = frames.view(B * T, C_in, H, W)  # [B*T, 3, H, W]
+        
+        with torch.set_grad_enabled(self.backbone_features.training):
+            # Get spatial feature maps
+            spatial_features = self.backbone_features(x)  # [B*T, feat_dim, h, w]
+        
+        # Apply spatial pooling
+        if hasattr(self.spatial_pool, 'forward'):
+            visual_features = self.spatial_pool(spatial_features)  # [B*T, feat_dim]
         else:
-            reg = torch.clamp(dist, 0.0, self.H)
-
+            visual_features = self.spatial_pool(spatial_features).flatten(1)  # [B*T, feat_dim]
+        
+        # Reshape back to sequence
+        visual_features = visual_features.view(B, T, -1)  # [B, T, feat_dim]
+        
+        # Project to hidden space
+        features = []
+        for t in range(T):
+            feat_t = self.feature_proj(visual_features[:, t])  # [B, hidden_channels]
+            features.append(feat_t)
+        
+        features = torch.stack(features, dim=2)  # [B, hidden_channels, T]
+        
+        # ---- Temporal modeling ----
+        temporal_features = self.temporal_cnn(features)  # [B, hidden_channels, T]
+        
+        # Convert back to [B, T, hidden_channels] for further processing
+        temporal_features_seq = temporal_features.transpose(1, 2)  # [B, T, hidden_channels]
+        
+        # ---- Phase classification (current state) ----
+        current_features = temporal_features_seq[:, -1]  # [B, hidden_channels] - last timestep
+        phase_logits = self.phase_head(current_features)  # [B, num_classes]
+        
+        # ---- Anticipation prediction ----
+        # Use attention pooling over the entire sequence
+        query = self.anticipation_query.expand(B, -1, -1)  # [B, 1, hidden_channels]
+        
+        attended_features, _ = self.temporal_attention(
+            query=query,
+            key=temporal_features_seq,
+            value=temporal_features_seq
+        )  # [B, 1, hidden_channels]
+        
+        attended_features = attended_features.squeeze(1)  # [B, hidden_channels]
+        anticipation_raw = self.anticipation_head(attended_features)  # [B, num_classes]
+        
+        # Apply constraints
+        anticipation = torch.clamp(anticipation_raw, 0.0, self.H)
+        
+        # Row-min constraint (at least one phase at time 0)
+        anticipation = anticipation - anticipation.min(dim=1, keepdim=True)[0]
+        anticipation = torch.clamp(anticipation, 0.0, self.H)
+        
         if return_aux:
             aux = {
-                "cls_repr": cls_repr.detach(),
-                "percls_mean": percls.detach().mean(dim=1),
+                'current_features': current_features.detach(),
+                'attended_features': attended_features.detach(),
+                'temporal_features_mean': temporal_features_seq.detach().mean(dim=1),
+                'anticipation_raw': anticipation_raw.detach(),
             }
-            return reg, logits, aux
-        return reg, logits
+            return anticipation, phase_logits, aux
+        
+        return anticipation, phase_logits
+    
+    def reset_all_memory(self):
+        """Dummy method for compatibility - this model is stateless"""
+        pass
 
+
+# Compatibility wrapper
+class WindowMemoryTransformer(TemporalCNNAnticipation):
+    """
+    Compatibility wrapper to maintain the same interface as the original model.
+    """
+    
+    def __init__(self, *args, **kwargs):
+        # Remove unused parameters from original model
+        unused_params = [
+            'tcn_stages', 'tcn_dilations', 'reg_activation', 'prior_mode',
+            'num_decoder_layers', 'd_model', 'nhead', 'num_encoder_layers',
+            'dim_feedforward', 'use_layer_norm'
+        ]
+        
+        for param in unused_params:
+            kwargs.pop(param, None)
+        
+        super().__init__(*args, **kwargs)
 
 # ---------------------------
 # Fixed training hyperparams
@@ -283,17 +443,17 @@ TIME_UNIT = "minutes"  # dataset outputs in minutes (or "seconds")
 NUM_CLASSES = 6
 
 # Temporal windowing
-SEQ_LEN = 10
-STRIDE = SEQ_LEN//2
+SEQ_LEN = 16   # MAX=352/BATCHSIZE
+STRIDE = 1 # SEQ_LEN//2
 
 # Batching / epochs
-BATCH_SIZE = 24
+BATCH_SIZE = 22
 NUM_WORKERS = 30
 EPOCHS = 20
 
 # Optimizer
-LR = 1e-4
-WEIGHT_DECAY = 1e-4
+LR = 3e-4
+WEIGHT_DECAY = 2e-4
 
 # Model hyper
 TIME_HORIZON = 2.0  # clamp targets/preds for stability in plots/metrics
@@ -611,17 +771,24 @@ def main():
     # ---------------------------
     gen_train = torch.Generator()
     gen_train.manual_seed(SEED)
-    train_batch_sampler_fixed = VideoBatchSampler(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        drop_last=False,
-        shuffle_videos=True,
-        generator=gen_train,
-        batch_videos=False,  # fixed-size batches within a video
-    )
+    # train_batch_sampler_fixed = VideoBatchSampler(
+    #     train_ds,
+    #     batch_size=BATCH_SIZE,
+    #     drop_last=False,
+    #     shuffle_videos=True,
+    #     generator=gen_train,
+    #     batch_videos=False,  # fixed-size batches within a video
+    # )
+    # train_loader = DataLoader(
+    #     train_ds,
+    #     batch_sampler=train_batch_sampler_fixed,
+    #     num_workers=NUM_WORKERS,
+    #     pin_memory=False,
+    # )
     train_loader = DataLoader(
         train_ds,
-        batch_sampler=train_batch_sampler_fixed,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=False,
     )
@@ -664,19 +831,15 @@ def main():
         sequence_length=SEQ_LEN,
         num_classes=NUM_CLASSES,
         time_horizon=TIME_HORIZON,
-        backbone="resnet50",
-        pretrained_backbone=True,   # True in real training
-        freeze_backbone=False,
-        d_model=256,
-        nhead=4,
-        num_encoder_layers=2,
-        num_decoder_layers=1,
-        dim_feedforward=512,
+        backbone="resnet18",              # Start light
+        pretrained_backbone=True,         
+        freeze_backbone=False,            
+        hidden_channels=256,             # Main hidden dimension
+        num_temporal_layers=5,           # 5 dilated conv layers
         dropout=0.1,
-        tcn_stages=2,
-        prior_mode="hard",
+        use_spatial_attention=True,      # Learn important spatial regions
     ).to(device)
-    model.reset_all_memory = lambda: None  # dummy
+    # model.reset_all_memory = lambda: None  # dummy
 
     # ---------------------------
     # Losses / Optim
