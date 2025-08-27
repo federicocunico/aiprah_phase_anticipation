@@ -19,7 +19,7 @@
             "name": "Train PegAndRing (GPU 1)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/step2_train_model.py",
+            "program": "${file}",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "args": [
@@ -28,7 +28,7 @@
                 "--time_horizon",
                 "1",
                 "--seq_len",
-                "4",
+                "10",
                 "--batch_size",
                 "32",
                 "--dataset",
@@ -36,7 +36,7 @@
                 "--num_classes",
                 "6",
                 "--exp_name",
-                "pegandring_t=1_s=4",
+                "pegandring_TEST_t=1_s=10",
                 "--wandb_project",
                 "SWA"
             ]

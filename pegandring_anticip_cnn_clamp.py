@@ -459,7 +459,7 @@ WEIGHT_DECAY = 2e-4
 TIME_HORIZON = 2.0  # clamp targets/preds for stability in plots/metrics
 
 PRINT_EVERY = 20
-CKPT_PATH = Path("best_temporal_transformer_plain.pth")
+CKPT_PATH = Path("peg_and_ring_cnn_clamp.pth")
 
 # Eval output dirs
 EVAL_ROOT = Path("eval_outputs")
