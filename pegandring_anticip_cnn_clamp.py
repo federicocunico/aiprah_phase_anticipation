@@ -925,7 +925,7 @@ def main():
                 best_val_mae = val_stats["mae"]
                 torch.save(model.state_dict(), CKPT_PATH)
                 print(
-                    f"✅  New best val_mae={best_val_mae:.4f} — saved to: {CKPT_PATH}"
+                    f"✅  New best val_mae={best_val_mae:.4f} val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}"
                 )
 
     # ---------------------------
