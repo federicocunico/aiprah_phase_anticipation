@@ -327,11 +327,8 @@ class TemporalCNNAnticipation(nn.Module):
     def forward(
         self,
         frames: torch.Tensor,
-        meta: Optional[Dict[str, Any]] = None,
+        meta = None,
         return_aux: bool = False,
-    ) -> (
-        Tuple[torch.Tensor, torch.Tensor]
-        | Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]
     ):
         """
         Args:
@@ -415,3 +412,4 @@ class TemporalCNNAnticipation(nn.Module):
             return anticipation, phase_logits, aux
 
         return anticipation, phase_logits
+

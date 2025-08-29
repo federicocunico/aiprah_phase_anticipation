@@ -14,6 +14,10 @@ Publishes both RAW and PROCESSED outputs.
 # =========================
 # Imports
 # =========================
+import os
+if "ROS_MASTER_URI" not in os.environ or "localhost" in os.environ["ROS_MASTER_URI"]:
+    print("Setting default ROS MASTER to James")
+    os.environ["ROS_MASTER_URI"] = "http://James:11311"
 import time
 from collections import deque
 from typing import Deque, Optional, Tuple
@@ -25,8 +29,8 @@ from PIL import Image
 import torch
 import torchvision.transforms as T
 
-from pegandring_anticip_tran import SEQ_LEN, WindowMemoryTransformer
 import rospy
+
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image as RosImage
 from std_msgs.msg import Int32, Float32, Float32MultiArray
@@ -38,9 +42,9 @@ from anticipation_model import TemporalCNNAnticipation as AnticipationTemporalMo
 # =========================
 # RUNTIME CONFIG CONSTANTS
 # =========================
-IMAGE_TOPIC         = "/endoscope/left/image_raw"        # incoming image topic
+IMAGE_TOPIC         = "/endoscope/left/image_color/compressed"        # incoming image topic
 TARGET_FPS          = 5.0                               # Hz: throttle processing to this FPS
-MODEL_PATH          = "/path/to/peg_and_ring_cnn_feedback.pth"  # checkpoint to load
+MODEL_PATH          = "/home/saras/saras/linux/src/aiprah/phase_anticpation/src/peg_and_ring_cnn_clamp.pth"  # checkpoint to load
 DEVICE_PREF         = "cuda"                            # "cuda" or "cpu"
 
 # Smoothing / reasoning
@@ -90,10 +94,6 @@ def load_model(device: torch.device) -> AnticipationTemporalModel:
     SEQ_LEN          = 16
     NUM_CLASSES      = 6
     TIME_HORIZON     = 2.0
-    D_MODEL          = 256
-    GRU_LAYERS       = 2
-    GRU_DROPOUT      = 0.2
-    FEEDBACK_DROPOUT = 0.2
     FUTURE_F         = 1
 
     model = AnticipationTemporalModel(
@@ -156,11 +156,13 @@ class AnticipationNode:
 
         # processed-phase memory (for monotonicity)
         self.last_phase_processed: int = 0
+        # throttling
+        self.min_period = 1.0 / max(TARGET_FPS, 1e-6)
+        self.last_proc_time: Optional[float] = None
+
+        self.start_time = time.time()
 
         # ROS I/O
-        self.bridge = CvBridge()
-        self.sub = rospy.Subscriber(IMAGE_TOPIC, RosImage, self.image_cb, queue_size=QUEUE_SIZE_SUB)
-
         self.pub_phase_raw   = rospy.Publisher(PHASE_TOPIC_RAW, Int32, queue_size=QUEUE_SIZE_PUB) if PUBLISH_RAW else None
         self.pub_pred_raw    = rospy.Publisher(ANTICIPATION_TOPIC_RAW, Float32MultiArray, queue_size=QUEUE_SIZE_PUB) if PUBLISH_RAW else None
 
@@ -168,9 +170,8 @@ class AnticipationNode:
         self.pub_pred_smooth = rospy.Publisher(ANTICIPATION_TOPIC_SMOOTH, Float32MultiArray, queue_size=QUEUE_SIZE_PUB)
         self.pub_ttnp        = rospy.Publisher(TTNP_TOPIC, Float32, queue_size=QUEUE_SIZE_PUB)
 
-        # throttling
-        self.min_period = 1.0 / max(TARGET_FPS, 1e-6)
-        self.last_proc_time: Optional[float] = None
+        self.bridge = CvBridge()
+        self.sub = rospy.Subscriber(IMAGE_TOPIC, RosImage, self.image_cb, queue_size=QUEUE_SIZE_SUB)
 
         rospy.loginfo("[anticipation_node] Ready. Waiting for images...")
 
@@ -233,6 +234,7 @@ class AnticipationNode:
 
         try:
             bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            cv2.imwrite("TEST.png", bgr)
         except Exception as e:
             rospy.logwarn(f"[anticipation_node] cv_bridge error: {e}")
             return
@@ -244,18 +246,25 @@ class AnticipationNode:
             self._publish_placeholder()
             return
 
+        reg: torch.Tensor
+        logits: torch.Tensor
         with torch.no_grad():
             frames = torch.stack(list(self.frame_buf), dim=0).unsqueeze(0).to(self.device)
-            prevA  = self._pad_prev_memory()
-            reg, logits = self.model(frames, prevA)
-            reg = reg.squeeze(0).clamp(min=-1.0, max=self.H)
-            logits = logits.squeeze(0)
+            # prevA  = self._pad_prev_memory()
+            reg, logits = self.model(frames)
+            reg = reg.squeeze(0) # 1x6 [0, H]
+            logits = logits.squeeze(0) # 1x6
 
-            self.prevA_buf.append(reg.detach().cpu())
+            # self.prevA_buf.append(reg.detach().cpu())
 
-        phase_proc, reg_smooth_np, ttnp_scalar, reg_raw_np, phase_raw = self._post_process(
-            reg_raw=reg, logits_raw=logits
-        )
+        # phase_proc, reg_smooth_np, ttnp_scalar, reg_raw_np, phase_raw = self._post_process(
+        #     reg_raw=reg, logits_raw=logits
+        # )
+        phase_proc = logits.argmax()
+        ttnp_scalar = reg[min(phase_proc+1, 5)]
+        phase_raw = phase_proc  # TMP
+        reg_raw_np = reg  # tmp
+        reg_smooth_np = reg  # tmp
 
         if PUBLISH_RAW:
             self.pub_pred_raw.publish(Float32MultiArray(data=reg_raw_np.tolist()))
@@ -280,3 +289,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
