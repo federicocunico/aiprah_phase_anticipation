@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # train_future_anticipation_transformer.py
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import time
 import random
 from pathlib import Path
@@ -447,7 +447,7 @@ SEQ_LEN = 16   # MAX=352/BATCHSIZE
 STRIDE = 1 # SEQ_LEN//2
 
 # Batching / epochs
-BATCH_SIZE = 22
+BATCH_SIZE = 64
 NUM_WORKERS = 30
 EPOCHS = 20
 
@@ -456,13 +456,13 @@ LR = 3e-4
 WEIGHT_DECAY = 2e-4
 
 # Model hyper
-TIME_HORIZON = 2.0  # clamp targets/preds for stability in plots/metrics
+TIME_HORIZON = 1.0  # clamp targets/preds for stability in plots/metrics
 
 PRINT_EVERY = 20
 CKPT_PATH = Path("peg_and_ring_cnn_clamp.pth")
 
 # Eval output dirs
-EVAL_ROOT = Path("eval_outputs")
+EVAL_ROOT = Path("results/eval_outputs_cnn_clamp")
 EVAL_CLS_DIR = EVAL_ROOT / "classification"
 EVAL_ANT_DIR = EVAL_ROOT / "anticipation"
 EVAL_CLS_DIR.mkdir(parents=True, exist_ok=True)
