@@ -25,19 +25,20 @@ from PIL import Image
 import torch
 import torchvision.transforms as T
 
+from pegandring_anticip_tran import SEQ_LEN, WindowMemoryTransformer
 import rospy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image as RosImage
 from std_msgs.msg import Int32, Float32, Float32MultiArray
 
 # Import your model definition only
-from anticipation_model import AnticipationTemporalModel
+from anticipation_model import TemporalCNNAnticipation as AnticipationTemporalModel
 
 
 # =========================
 # RUNTIME CONFIG CONSTANTS
 # =========================
-IMAGE_TOPIC         = "/camera/color/image_raw"        # incoming image topic
+IMAGE_TOPIC         = "/endoscope/left/image_raw"        # incoming image topic
 TARGET_FPS          = 5.0                               # Hz: throttle processing to this FPS
 MODEL_PATH          = "/path/to/peg_and_ring_cnn_feedback.pth"  # checkpoint to load
 DEVICE_PREF         = "cuda"                            # "cuda" or "cpu"
@@ -99,17 +100,16 @@ def load_model(device: torch.device) -> AnticipationTemporalModel:
         sequence_length=SEQ_LEN,
         num_classes=NUM_CLASSES,
         time_horizon=TIME_HORIZON,
-        backbone="resnet18",
-        pretrained_backbone=True,
-        freeze_backbone=False,
-        d_model=D_MODEL,
-        gru_layers=GRU_LAYERS,
-        gru_dropout=GRU_DROPOUT,
-        feedback_dropout=FEEDBACK_DROPOUT,
-        future_F=FUTURE_F,
+        backbone="resnet18",              # Start light
+        pretrained_backbone=True,         
+        freeze_backbone=False,            
+        hidden_channels=256,             # Main hidden dimension
+        num_temporal_layers=5,           # 5 dilated conv layers
+        dropout=0.1,
+        use_spatial_attention=True,      # Learn important spatial regions
     ).to(device)
 
-    ckpt = torch.load(MODEL_PATH, map_location=device)
+    ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=True)
     model.load_state_dict(ckpt, strict=False)
     model.eval()
 
