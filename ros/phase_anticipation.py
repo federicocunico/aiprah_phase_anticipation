@@ -20,7 +20,7 @@ if "ROS_MASTER_URI" not in os.environ or "localhost" in os.environ["ROS_MASTER_U
     os.environ["ROS_MASTER_URI"] = "http://James:11311"
 import time
 from collections import deque
-from typing import Deque, Optional, Tuple
+from typing import Deque, Optional, Tuple, List
 
 import numpy as np
 import cv2
@@ -48,15 +48,15 @@ MODEL_PATH          = "/home/saras/saras/linux/src/aiprah/phase_anticpation/src/
 DEVICE_PREF         = "cuda"                            # "cuda" or "cpu"
 
 # Smoothing / reasoning
-SMOOTH_WINDOW_N     = 10                                # number of recent steps to average over
+SMOOTH_WINDOW_N     = 10                                # (legacy deque not used by new policy; kept for compatibility)
 PUBLISH_RAW         = True                              # also publish raw logits/reg
 
 # ROS topics to publish
 ANTICIPATION_TOPIC_RAW   = "/anticipation/anticip_raw"         # Float32MultiArray (len C)
-PHASE_TOPIC_RAW          = "/anticipation/phase_raw"        # Int32
+PHASE_TOPIC_RAW          = "/anticipation/phase_raw"           # Int32
 ANTICIPATION_TOPIC_SMOOTH= "/anticipation/anticip_smooth"      # Float32MultiArray (len C)
-PHASE_TOPIC_SMOOTH       = "/anticipation/phase_smooth"     # Int32
-TTNP_TOPIC               = "/anticipation/ttnp"             # Float32 (scalar: time to next phase)
+PHASE_TOPIC_SMOOTH       = "/anticipation/phase_smooth"        # Int32
+TTNP_TOPIC               = "/anticipation/ttnp"                # Float32 (scalar: time to next phase)
 
 QUEUE_SIZE_SUB      = 10
 QUEUE_SIZE_PUB      = 10
@@ -82,6 +82,108 @@ class Preprocessing:
 
 
 # =========================
+# High-level policy (constraint logic)
+# =========================
+class HighLevelPolicy:
+    """
+    Rule-based constraint layer on top of model outputs.
+
+    - Phase is chosen *only* from reg: phase = argmin(smoothed_reg)
+    - Monotonic: can't go back to earlier phases.
+    - Must observe phase 0 once before allowing >0.
+    - Smooths reg over time via a time-aware EMA (inertia).
+      alpha = 1 - exp(-dt / tau_seconds)
+    """
+
+    def __init__(self, num_classes: int, horizon_H: float, tau_seconds: float = 0.5, start_phase: int = 0):
+        self.C = int(num_classes)
+        self.H = float(horizon_H)
+        self.tau = float(tau_seconds)              # smoothing time constant (s)
+        self.start_phase = int(start_phase)
+
+        self.smoothed_reg: Optional[np.ndarray] = None  # shape [C]
+        self.current_phase: int = self.start_phase
+        self.seen_phase0: bool = False
+        self.last_seen_time: List[Optional[float]] = [None] * self.C
+        self.last_time: Optional[float] = None
+
+    def reset(self):
+        self.smoothed_reg = None
+        self.current_phase = self.start_phase
+        self.seen_phase0 = False
+        self.last_seen_time = [None] * self.C
+        self.last_time = None
+
+    def update(self, reg_tensor: torch.Tensor, now: float) -> Tuple[int, np.ndarray, float, int]:
+        """
+        Args:
+            reg_tensor: torch.Tensor [C] (on any device)
+            now: float wall/ROS time (seconds)
+
+        Returns:
+            phase_proc_int: int
+            smoothed_reg_np: np.ndarray [C]
+            ttnp_scalar_float: float
+            phase_raw_from_reg: int  (argmin on *raw* reg)
+        """
+        # Convert to numpy (CPU) for policy
+        reg_np = reg_tensor.detach().cpu().float().numpy()
+
+        # Initialize smoothing state
+        if self.smoothed_reg is None:
+            self.smoothed_reg = reg_np.copy()
+            dt = None
+            alpha = 1.0  # first sample: take it
+        else:
+            dt = (now - self.last_time) if self.last_time is not None else None
+            if dt is None or dt <= 0.0:
+                alpha = 1.0
+            else:
+                alpha = 1.0 - np.exp(-dt / max(self.tau, 1e-6))
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+
+            self.smoothed_reg = (1.0 - alpha) * self.smoothed_reg + alpha * reg_np
+
+        # --- Phase proposals ---
+        # Raw (unsmoothed) phase from reg, for RAW topic
+        phase_raw_from_reg = int(np.argmin(reg_np))
+
+        # Smoothed phase (policy uses this)
+        candidate_phase = int(np.argmin(self.smoothed_reg))
+
+        # Track "last time seen" for the candidate
+        self.last_seen_time[candidate_phase] = now
+
+        # --- Constraints ---
+        if not self.seen_phase0:
+            # Must start at phase 0; clamp until 0 is observed
+            if candidate_phase == 0:
+                self.seen_phase0 = True
+                self.current_phase = 0
+            else:
+                self.current_phase = 0  # hold at 0 until we truly see 0
+        else:
+            # Monotonic non-decreasing
+            if candidate_phase >= self.current_phase:
+                self.current_phase = candidate_phase
+            # else: keep current (can't go back)
+
+        # --- TTNP from next phase's smoothed reg ---
+        if self.current_phase >= self.C - 1:
+            ttnp_scalar_float = 0.0
+        else:
+            next_idx = self.current_phase + 1
+            ttnp_scalar_float = float(self.smoothed_reg[next_idx])
+
+        self.last_time = now
+
+        return self.current_phase, self.smoothed_reg.copy(), ttnp_scalar_float, phase_raw_from_reg
+
+    def get_last_seen_times(self) -> List[Optional[float]]:
+        return list(self.last_seen_time)
+
+
+# =========================
 # Model Loader
 # =========================
 def load_model(device: torch.device) -> AnticipationTemporalModel:
@@ -101,20 +203,22 @@ def load_model(device: torch.device) -> AnticipationTemporalModel:
         num_classes=NUM_CLASSES,
         time_horizon=TIME_HORIZON,
         backbone="resnet18",              # Start light
-        pretrained_backbone=True,         
-        freeze_backbone=False,            
-        hidden_channels=256,             # Main hidden dimension
-        num_temporal_layers=5,           # 5 dilated conv layers
+        pretrained_backbone=True,
+        freeze_backbone=False,
+        hidden_channels=256,              # Main hidden dimension
+        num_temporal_layers=5,            # 5 dilated conv layers
         dropout=0.1,
-        use_spatial_attention=True,      # Learn important spatial regions
+        use_spatial_attention=True,       # Learn important spatial regions
     ).to(device)
 
     ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=True)
     model.load_state_dict(ckpt, strict=False)
     model.eval()
 
-    # bootstrap (init lazy buffers like BN, etc.)
-    with torch.no_grad():
+    # Bootstrap (init lazy buffers like BN, etc.)
+    _inference_mode = getattr(torch, "inference_mode", None)
+    ctx = _inference_mode() if _inference_mode is not None else torch.no_grad()
+    with ctx:
         dummy_frames = torch.randn(1, SEQ_LEN, 3, 224, 224, device=device)
         dummy_prevA  = torch.zeros(1, FUTURE_F, NUM_CLASSES, device=device)
         _ = model(dummy_frames, dummy_prevA)
@@ -134,6 +238,12 @@ class AnticipationNode:
             self.device = torch.device("cpu")
         rospy.loginfo(f"[anticipation_node] Using device: {self.device}")
 
+        # (Optional) cuDNN autotuner for fixed-size inputs.
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
         # load model
         self.model = load_model(self.device)
 
@@ -150,17 +260,19 @@ class AnticipationNode:
         self.frame_buf: Deque[torch.Tensor] = deque(maxlen=self.T)
         self.prevA_buf: Deque[torch.Tensor] = deque(maxlen=self.M)
 
-        # smoothing history
+        # (legacy) smoothing history — unused by new policy
         self.hist_logits: Deque[torch.Tensor] = deque(maxlen=SMOOTH_WINDOW_N)  # each [C]
         self.hist_reg:    Deque[torch.Tensor] = deque(maxlen=SMOOTH_WINDOW_N)  # each [C]
 
-        # processed-phase memory (for monotonicity)
-        self.last_phase_processed: int = 0
         # throttling
         self.min_period = 1.0 / max(TARGET_FPS, 1e-6)
         self.last_proc_time: Optional[float] = None
 
         self.start_time = time.time()
+
+        # High-level policy (super-logic)
+        # tau_seconds controls smoothing inertia; tune as you like (e.g., 0.4–1.0s)
+        self.policy = HighLevelPolicy(num_classes=self.C, horizon_H=self.H, tau_seconds=0.6, start_phase=0)
 
         # ROS I/O
         self.pub_phase_raw   = rospy.Publisher(PHASE_TOPIC_RAW, Int32, queue_size=QUEUE_SIZE_PUB) if PUBLISH_RAW else None
@@ -195,36 +307,6 @@ class AnticipationNode:
         self.pub_phase_smooth.publish(Int32(data=0))
         self.pub_ttnp.publish(Float32(data=float(self.H)))
 
-    def _post_process(
-        self,
-        reg_raw: torch.Tensor,
-        logits_raw: torch.Tensor,
-    ) -> Tuple[int, np.ndarray, float, np.ndarray, int]:
-        # append to history
-        self.hist_reg.append(reg_raw.detach().cpu())
-        self.hist_logits.append(logits_raw.detach().cpu())
-
-        # RAW
-        phase_raw = int(torch.argmax(logits_raw).item())
-        reg_raw_np = self.hist_reg[-1].numpy()
-
-        # SMOOTH
-        logits_mean = torch.stack(list(self.hist_logits), dim=0).mean(dim=0)
-        reg_mean    = torch.stack(list(self.hist_reg), dim=0).mean(dim=0)
-
-        phase_smooth_candidate = int(torch.argmax(logits_mean).item())
-        phase_proc = max(self.last_phase_processed, phase_smooth_candidate)
-        phase_proc = min(phase_proc, self.MAX_PHASE)
-        self.last_phase_processed = phase_proc
-
-        if phase_proc >= self.MAX_PHASE:
-            ttnp_scalar = 0.0
-        else:
-            next_idx = min(phase_proc + 1, self.MAX_PHASE)
-            ttnp_scalar = float(reg_mean[next_idx].item())
-
-        return phase_proc, reg_mean.numpy(), ttnp_scalar, reg_raw_np, phase_raw
-
     # ---------- callback ----------
     def image_cb(self, msg: RosImage):
         now = msg.header.stamp.to_sec() if msg.header.stamp else time.time()
@@ -246,33 +328,32 @@ class AnticipationNode:
             self._publish_placeholder()
             return
 
-        reg: torch.Tensor
-        logits: torch.Tensor
-        with torch.no_grad():
+        # Prefer inference_mode if available; otherwise no_grad.
+        _inference_mode = getattr(torch, "inference_mode", None)
+        ctx = _inference_mode() if _inference_mode is not None else torch.no_grad()
+
+        with ctx:
             frames = torch.stack(list(self.frame_buf), dim=0).unsqueeze(0).to(self.device)
             # prevA  = self._pad_prev_memory()
-            reg, logits = self.model(frames)
-            reg = reg.squeeze(0) # 1x6 [0, H]
-            logits = logits.squeeze(0) # 1x6
+            reg, _logits_unused = self.model(frames)  # logits ignored by design
+            reg = reg.squeeze(0)       # [C]
 
-            # self.prevA_buf.append(reg.detach().cpu())
+        # ---- High-level policy (from reg only) ----
+        phase_proc_int, reg_smooth_np, ttnp_scalar_float, phase_raw_from_reg = self.policy.update(reg, now)
 
-        # phase_proc, reg_smooth_np, ttnp_scalar, reg_raw_np, phase_raw = self._post_process(
-        #     reg_raw=reg, logits_raw=logits
-        # )
-        phase_proc = logits.argmax()
-        ttnp_scalar = reg[min(phase_proc+1, 5)]
-        phase_raw = phase_proc  # TMP
-        reg_raw_np = reg  # tmp
-        reg_smooth_np = reg  # tmp
+        # Prepare raw/smooth arrays
+        reg_raw_list = reg.detach().cpu().float().tolist()
+        reg_smooth_list = reg_smooth_np.astype(np.float32).tolist()
 
+        # RAW publications (from *raw* reg)
         if PUBLISH_RAW:
-            self.pub_pred_raw.publish(Float32MultiArray(data=reg_raw_np.tolist()))
-            self.pub_phase_raw.publish(Int32(data=phase_raw))
+            self.pub_pred_raw.publish(Float32MultiArray(data=reg_raw_list))
+            self.pub_phase_raw.publish(Int32(data=int(phase_raw_from_reg)))
 
-        self.pub_pred_smooth.publish(Float32MultiArray(data=reg_smooth_np.tolist()))
-        self.pub_phase_smooth.publish(Int32(data=phase_proc))
-        self.pub_ttnp.publish(Float32(data=float(ttnp_scalar)))
+        # PROCESSED publications (policy outputs)
+        self.pub_pred_smooth.publish(Float32MultiArray(data=reg_smooth_list))
+        self.pub_phase_smooth.publish(Int32(data=int(phase_proc_int)))
+        self.pub_ttnp.publish(Float32(data=float(ttnp_scalar_float)))
 
     def spin(self):
         rospy.spin()
@@ -289,4 +370,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
