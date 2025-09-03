@@ -482,16 +482,16 @@ TIME_UNIT = "minutes"  # dataset outputs in minutes (or "seconds")
 NUM_CLASSES = 6
 
 # Temporal windowing
-SEQ_LEN = 16  # MAX=352/BATCHSIZE
+SEQ_LEN = 30  # MAX=352/BATCHSIZE
 STRIDE = 1  # SEQ_LEN//2
 
 # Batching / epochs
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 NUM_WORKERS = 30
 EPOCHS = 20
 
 # Optimizer
-LR = 3e-4
+LR = 2e-4
 WEIGHT_DECAY = 2e-4
 
 # Model hyper
@@ -925,7 +925,8 @@ def main():
     # ---------------------------
     # Training loop
     # ---------------------------
-    best_val_acc = -float("inf")
+    # best_val_acc = -float("inf")
+    best_val_mae = float("inf")
 
     if True:
         for epoch in range(1, EPOCHS + 1):
@@ -996,12 +997,13 @@ def main():
             print(
                 f"\t\tval_acc={val_stats['acc']:.4f} | val_mae={val_stats['mae']:.4f} | val_ce={val_stats['ce']:.4f} | samples={val_stats['samples']}"
             )
-            val_acc = val_stats["acc"]
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            # val_acc = val_stats["acc"]
+            val_mae = val_stats["mae"]
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
                 torch.save(model.state_dict(), CKPT_PATH)
                 print(
-                    f"✅  New best val_acc={best_val_acc:.4f} val_mae={val_stats['mae']:.4f} — saved to: {CKPT_PATH}"
+                    f"✅  New best val_mae={best_val_mae:.4f} | val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}"
                 )
 
     # ---------------------------

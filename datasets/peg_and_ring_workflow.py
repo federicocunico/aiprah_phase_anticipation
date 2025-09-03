@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import time
+import random
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
@@ -18,6 +19,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.sampler import Sampler
 from torch.utils.data import BatchSampler
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 from torchvision.transforms import (
     Resize,
     RandomCrop,
@@ -81,9 +83,71 @@ def _get_total_frames_and_fps_cv2(video_path: Path) -> Tuple[int, float]:
 
 
 def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
+    """
+    Produce two figures per video:
+      1) Multi-plot (6 stacked) showing predicted vs GT time-to-next-phase per class.
+      2) Completion percentage figure (stacked subplots): GT completion, and predicted
+         completion (if prediction file exists). Completions are in [0, 1].
+    """
     root = "data/peg_and_ring_workflow"
     root_path = Path(root)
+    images_save_path = root_path / "_visualizations"
+    images_save_path.mkdir(exist_ok=True, parents=True)
     time_unit = "minutes"
+
+    def _compute_completion_from_times(times: np.ndarray) -> np.ndarray:
+        """
+        Compute per-frame completion in [0,1] using only the per-class times matrix.
+        times: [N, NUM_CLASSES] in chosen units (can include sentinels/negatives).
+        Follows the same logic as dataset precomputation and enforces 0 at segment starts.
+        """
+        N, C = times.shape
+        # derive phase per frame
+        phase_dense = np.empty(N, dtype=np.int64)
+        for t in range(N):
+            row = times[t]
+            zeros = np.where(row == 0.0)[0]
+            phase_dense[t] = int(zeros[0]) if len(zeros) else int(np.argmin(row))
+
+        completion = np.zeros(N, dtype=np.float32)
+        start = 0
+        TOL = 1e-6
+
+        while start < N:
+            p = int(phase_dense[start])
+            end = start
+            while end + 1 < N and int(phase_dense[end + 1]) == p:
+                end += 1
+            length = end - start + 1
+
+            completion[start] = 0.0  # exact 0 at segment start
+
+            if length == 1:
+                start = end + 1
+                continue
+
+            if p >= (NUM_CLASSES - 1):
+                # last phase: linear ramp inside segment
+                for i in range(1, length):
+                    completion[start + i] = float(i) / float(length - 1)
+            else:
+                total = float(times[start, p + 1])
+                valid_total = (total > 0)
+                for i in range(1, length):
+                    remaining = float(times[start + i, p + 1])
+                    if (not valid_total) or (remaining < 0):
+                        completion[start + i] = float(i) / float(length - 1)
+                    else:
+                        num = max(0.0, total - remaining)
+                        if abs(remaining - total) <= TOL:
+                            num = 0.0
+                        comp = num / max(total, 1e-9)
+                        completion[start + i] = float(np.clip(comp, 0.0, 1.0))
+
+            start = end + 1
+
+        return completion
+
     clamp_fn = lambda x, min_val: (
         torch.clamp(torch.asarray(x), min=min_val, max=time_horizon).numpy()
         if time_horizon is not None
@@ -115,13 +179,13 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
         frames_dir: Path = meta["frames_dir"]
         N = meta["N"]
 
-        gts = ds.ant_cache[videoname]
+        gts = ds.ant_cache[videoname]  # [N_frames, 6]
         MIN_VAL = gts.min()  # 0 or -1
         if gts.shape[0] != N:
             N = min(N, gts.shape[0])
             gts = gts[:N]
 
-        gts = clamp_fn(gts, MIN_VAL)
+        gts_clamped = clamp_fn(gts, MIN_VAL)
 
         pred_path = frames_dir / f"{videoname}_pred_1fps_{unit_tag}.npy"
         if pred_path.exists():
@@ -131,29 +195,30 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
                     f"[WARN] {videoname}: predictions shape {arr.shape} != ({N},6). Clipping."
                 )
                 arr = arr[:N, :6]
-            arr = clamp_fn(arr, MIN_VAL)
+            arr_clamped = clamp_fn(arr, MIN_VAL)
         else:
             print(f"[WARN] {videoname}: prediction file not found: {pred_path}")
-            arr = None
+            arr_clamped = None
 
+        # ---------------- Figure 1: Per-class times (stacked) ----------------
         fig, axs = plt.subplots(6, 1, sharex=True, figsize=(12, 12))
         y_upper = time_horizon * 1.05 if time_horizon is not None else None
 
         x = np.arange(N)
         for i in range(6):
-            if arr is not None:
+            if arr_clamped is not None:
                 axs[i].plot(
-                    x, arr[:N, i], linestyle="-", label="Predicted", linewidth=2
+                    x, arr_clamped[:N, i], linestyle="-", label="Predicted", linewidth=2
                 )
             axs[i].plot(
-                x, gts[:N, i], linestyle="--", label="Ground Truth", linewidth=2
+                x, gts_clamped[:N, i], linestyle="--", label="Ground Truth", linewidth=2
             )
             axs[i].set_ylabel(f"Phase {i}")
             axs[i].grid(True)
             if y_upper is not None:
                 axs[i].set_ylim(MIN_VAL, y_upper)
 
-        axs[-1].set_xlabel("Frame index (1 FPS)")
+        axs[-1].set_xlabel("Frame index")
         fig.suptitle(
             f"Predicted Time to Next Phase — {videoname} ({time_unit}, horizon={time_horizon} fps={fps})"
         )
@@ -165,13 +230,49 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
         img_fname = (
-            root_path
+            images_save_path
             / f"{videoname}_anticipation_plot_{unit_tag}_h={time_horizon:g}_fps={fps}.png"
         )
         plt.savefig(img_fname, dpi=150)
         plt.close(fig)
-
         print(f"[OK] Saved plot -> {img_fname}")
+
+        # ---------------- Figure 2: Completion % (stacked) ----------------
+        # GT completion from dataset cache (already aligned to frames)
+        compl_gt_full = ds.compl_cache[videoname]
+        compl_gt = compl_gt_full[:N]
+
+        # Predicted completion (if predictions present)
+        compl_pred = None
+        if arr_clamped is not None:
+            compl_pred = _compute_completion_from_times(arr_clamped[:N])
+
+        # Build stacked figure: GT and (if present) Pred
+        n_rows = 2 if compl_pred is not None else 1
+        fig2, axs2 = plt.subplots(n_rows, 1, sharex=True, figsize=(12, 4 * n_rows))
+        if n_rows == 1:
+            axs2 = [axs2]
+
+        axs2[0].plot(x, compl_gt, linestyle="--", linewidth=2, label="GT Completion")
+        axs2[0].set_ylabel("Completion")
+        axs2[0].grid(True)
+        axs2[0].set_ylim(0.0, 1.0)
+        axs2[0].set_title(f"{videoname} — Completion (GT)")
+
+        if compl_pred is not None:
+            axs2[1].plot(x, compl_pred, linestyle="-", linewidth=2, label="Pred Completion")
+            axs2[1].set_ylabel("Completion")
+            axs2[1].grid(True)
+            axs2[1].set_ylim(0.0, 1.0)
+            axs2[1].set_title(f"{videoname} — Completion (Pred)")
+
+        axs2[-1].set_xlabel("Frame index")
+
+        plt.tight_layout()
+        img_fname2 = images_save_path / f"{videoname}_completion_plot_{unit_tag}_fps={fps}.png"
+        plt.savefig(img_fname2, dpi=150)
+        plt.close(fig2)
+        print(f"[OK] Saved plot -> {img_fname2}")
 
 
 class PegAndRing(Dataset):
@@ -200,6 +301,8 @@ class PegAndRing(Dataset):
         "frames_depths": [T] list[str]
         "depths": FloatTensor [T, H, W]
         "frames_rgbd": FloatTensor [T, 4, H, W]
+        # added:
+        "phase_completition": torch.FloatTensor scalar in [0, 1]
     """
 
     def __init__(
@@ -213,7 +316,7 @@ class PegAndRing(Dataset):
         time_unit: str = "minutes",
         mean: Tuple[float, float, float] = (0.26728517, 0.32384375, 0.2749076),
         std: Tuple[float, float, float] = (0.15634732, 0.167153, 0.15354523),
-        transform: Optional[Callable] = None,
+        transform: Optional[Callable] = None,  # (kept for API, unused for train)
         to_rgb: bool = True,
         dtype: torch.dtype = torch.float32,
         rgbd_mode: bool = False,
@@ -222,6 +325,7 @@ class PegAndRing(Dataset):
         future_F: int = 1,
         add_depth_to_frames: bool = True,
         prev_T: int = 0,
+        augment: bool = False
     ):
         super().__init__()
         assert fps in [1, 5], "Not implemented with FPS not in [1, 5]"
@@ -230,6 +334,7 @@ class PegAndRing(Dataset):
         self.root = Path(root_dir)
         self.mode = mode.lower().strip()
         assert self.mode in ("train", "val", "test")
+        self.augment = augment
         self.seq_len = int(seq_len)
         self.stride = int(stride)
         self.time_unit = time_unit.lower().strip()
@@ -251,33 +356,18 @@ class PegAndRing(Dataset):
         self.prev_T = int(prev_T)
         assert self.prev_T >= 0
 
-        self.train_transform = transforms.Compose(
-            [
-                Resize((250, 250)),
-                # RandomCrop(224),
-                # RandomHorizontalFlip(),
-                # ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-                # RandomRotation(5),
-                CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ]
-        )
-        self.test_transform = transforms.Compose(
-            [
-                Resize((250, 250)),
-                CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ]
-        )
-        self.transform = (
-            self.train_transform
-            if (transform is None and self.mode == "train")
-            else (self.test_transform if transform is None else transform)
-        )
+        # --------- Transforms (ensure temporal consistency for a window) ---------
+        # We will not use per-frame transforms.Compose for training; instead, we
+        # generate *one* set of random params per window and apply it to all frames.
+        # For eval/val/test we keep deterministic resize+center-crop.
+        self.resize_size = (250, 250)
+        self.crop_size = (224, 224)
+        self.train_color_jitter = dict(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)
+        self.train_rotation = 5  # degrees
+        self.hflip_p = 0.5
+        self.use_train_aug = (self.mode == "train") and (self.augment == True)
 
-        val_videos = {"video01", "video04"}
+        val_videos = {"video01", "video13", "video15", "video22", "video27"}
         all_entries = _list_videos_with_fps(self.root, self.fps)
         if not all_entries:
             raise RuntimeError(
@@ -300,6 +390,7 @@ class PegAndRing(Dataset):
         print(f"Loading {self.mode} split...")
 
         self.ant_cache: Dict[str, np.ndarray] = {}
+        self.compl_cache: Dict[str, np.ndarray] = {}  # per-frame completion in [0,1]
         self.meta: Dict[str, Tuple[int, float]] = {}
         unit_tag = f"{self.time_unit}"
 
@@ -334,6 +425,10 @@ class PegAndRing(Dataset):
 
             self.ant_cache[videoname] = ant_unit.astype(np.float32)
 
+            # ---------- NEW: pre-compute per-frame completion in [0,1] ----------
+            compl = self._precompute_phase_completion_per_frame(ant_unit)
+            self.compl_cache[videoname] = compl.astype(np.float32)  # shape [n1]
+
             for local_idx, fp in enumerate(frame_paths):
                 flat_index.append((videoname, frames_dir, fp, local_idx))
 
@@ -348,9 +443,9 @@ class PegAndRing(Dataset):
         for videoname, bundle in by_video.items():
             items = sorted(bundle["items"], key=lambda t: t[2])
             N = len(items)
-            for start in range(0, max(0, N - self.seq_len + 1), self.stride):
-                end = start + self.seq_len
-                idxs = items[start:end]
+            for start_idx in range(0, max(0, N - self.seq_len + 1), self.stride):
+                end_idx = start_idx + self.seq_len
+                idxs = items[start_idx:end_idx]
                 if len(idxs) < self.seq_len:
                     continue
                 frame_idxs = [li for _, _, li in idxs]
@@ -374,47 +469,46 @@ class PegAndRing(Dataset):
                     if len(depth_paths_exist) == len(frame_paths):
                         window["frames_depths"] = depth_paths_exist
 
-                ant_at_fps = self.ant_cache[videoname]
-                gts_window = ant_at_fps[frame_idxs]  # [T, C]
+                ant_at_fps = self.ant_cache[videoname]        # [N_frames, C]
+                gts_window = ant_at_fps[frame_idxs]           # [T, C]
 
+                # determine dense phases from GT anticipation
                 phase_dense = []
                 for row in gts_window:
                     z = np.where(row == 0.0)[0]
                     phase_dense.append(int(z[0]) if len(z) else int(np.argmin(row)))
                 phase_last = int(phase_dense[-1])
 
-                # ----- Previous-memory features (prev_T context) -----
-                # dt is the time delta between consecutive 1-FPS frames in chosen units
-                dt = 1.0 if self.time_unit == "seconds" else (1.0 / 60.0)
+                # dt between consecutive sampled frames (in chosen units)
+                if self.time_unit == "seconds":
+                    dt = 1.0 / float(self.fps)
+                else:  # minutes
+                    dt = 1.0 / (float(self.fps) * 60.0)
 
                 # last_phase / last_anticipation (at T-1)
                 if self.seq_len >= 2:
                     last_phase = int(phase_dense[-2])
                     last_anticipation = gts_window[-2].astype(np.float32)
                 else:
-                    # Fallback: default phase=0, anticipation adjusted from first row by +dt, with phase-0 pinned to 0
                     base = gts_window[0].copy()
                     adj = base + dt
                     adj[0] = 0.0
                     last_phase = 0
                     last_anticipation = adj.astype(np.float32)
 
-                # prev sequences: times T-prev_T .. T-1 (length prev_T), left-padded if needed
+                # prev sequences: T-prev_T .. T-1
                 prev_len = self.prev_T
                 prev_phases_list: List[int] = []
                 prev_ants_list: List[np.ndarray] = []
-
                 if prev_len > 0:
-                    # within-window available history up to T-1
                     take_start = max(0, self.seq_len - prev_len)
-                    take_end = self.seq_len  # exclusive
+                    take_end = self.seq_len
                     hist_phases = phase_dense[take_start:take_end]
                     hist_ants = gts_window[take_start:take_end]
 
                     missing = prev_len - len(hist_phases)
                     if missing > 0:
                         base = gts_window[0].copy()
-                        # Create missing rows further in the past: older first
                         for s in range(missing, 0, -1):
                             vec = (base + s * dt).astype(np.float32)
                             vec[0] = 0.0
@@ -427,11 +521,15 @@ class PegAndRing(Dataset):
 
                     prev_anticipation = np.stack(prev_ants_list, axis=0).astype(
                         np.float32
-                    )  # [prev_T, C]
+                    )
                     prev_phases = np.asarray(prev_phases_list, dtype=np.int64)
                 else:
                     prev_anticipation = np.zeros((0, NUM_CLASSES), dtype=np.float32)
                     prev_phases = np.zeros((0,), dtype=np.int64)
+
+                # Use precomputed per-frame completion (for the *last* frame in the window)
+                completion_arr = self.compl_cache[videoname]  # [N_frames]
+                completion_last = float(completion_arr[frame_idxs[-1]])
 
                 window.update(
                     {
@@ -450,6 +548,7 @@ class PegAndRing(Dataset):
                         "last_anticipation": last_anticipation,
                         "prev_phases": prev_phases,
                         "prev_anticipation": prev_anticipation,
+                        "phase_completition": completion_last,  # scalar float in [0,1]
                     }
                 )
                 self.windows.append(window)
@@ -460,17 +559,72 @@ class PegAndRing(Dataset):
             for fp, li in zip(w["frames_filepath"], w["frames_indexes"])
         ]
 
-        # --- New: mapping windows -> by video for samplers ---
+        # --- mapping windows -> by video for samplers ---
         self.video_names: List[str] = [vn for vn, *_ in entries]
         self.windows_by_video: Dict[str, List[int]] = {}
         for wi, w in enumerate(self.windows):
             self.windows_by_video.setdefault(w["video_name"], []).append(wi)
 
-        # Ensure per-video window indices are in ascending temporal order
         for vn in self.windows_by_video:
             self.windows_by_video[vn].sort()
 
         print(f"Loading done in {1/(time.time() - start):.2f} seconds")
+
+    # --------- NEW: precompute completion per frame (using ant_unit only) ----------
+    def _precompute_phase_completion_per_frame(self, ant_unit: np.ndarray) -> np.ndarray:
+        """
+        Given ant_unit [N_frames, NUM_CLASSES], compute per-frame completion in [0,1]
+        towards the next phase. Enforces completion[start_of_segment] == 0 exactly.
+        """
+        N, C = ant_unit.shape
+        phase_dense = np.empty(N, dtype=np.int64)
+        for t in range(N):
+            row = ant_unit[t]
+            zeros = np.where(row == 0.0)[0]
+            phase_dense[t] = int(zeros[0]) if len(zeros) else int(np.argmin(row))
+
+        completion = np.zeros(N, dtype=np.float32)
+        start = 0
+        TOL = 1e-6  # tolerance for float jitter
+
+        while start < N:
+            p = int(phase_dense[start])
+            end = start
+            while end + 1 < N and int(phase_dense[end + 1]) == p:
+                end += 1
+            length = end - start + 1
+
+            # default: 0 at the first frame of the segment
+            completion[start] = 0.0
+
+            # If there's only one frame in this segment, keep it at 0 (even for last phase)
+            if length == 1:
+                start = end + 1
+                continue
+
+            if p >= (NUM_CLASSES - 1):
+                # Last phase: no p+1 target. Use linear ramp within the segment but start at 0.
+                for i in range(1, length):
+                    completion[start + i] = float(i) / float(length - 1)
+            else:
+                total = float(ant_unit[start, p + 1])
+                valid_total = (total > 0)
+                for i in range(1, length):
+                    remaining = float(ant_unit[start + i, p + 1])
+                    if (not valid_total) or (remaining < 0):
+                        # fallback to linear ramp
+                        completion[start + i] = float(i) / float(length - 1)
+                    else:
+                        # snap tiny jitter so the first step stays near 0
+                        num = max(0.0, total - remaining)
+                        if abs(remaining - total) <= TOL:
+                            num = 0.0
+                        comp = num / max(total, 1e-9)
+                        completion[start + i] = float(np.clip(comp, 0.0, 1.0))
+
+            start = end + 1
+
+        return completion
 
     def _map_sample_index_to_source_frame(
         self,
@@ -479,15 +633,9 @@ class PegAndRing(Dataset):
         src_fps: float,
         total_frames: int,
     ) -> int:
-        """
-        Map the i-th sampled frame (taken at `sample_fps`) to the nearest
-        source-frame index in a video that runs at `src_fps`.
-        """
         if total_frames <= 0:
             return 0
-        # Timestamp of the sampled frame
         t = i_sample / max(sample_fps, 1e-9)
-        # Corresponding source-frame index
         src = int(round(t * src_fps))
         return min(max(src, 0), total_frames - 1)
 
@@ -499,12 +647,6 @@ class PegAndRing(Dataset):
         total_frames: int,
         n_sampled: int,  # number of frames extracted at self.fps for this video
     ) -> np.ndarray:
-        """
-        Convert the raw anticipation matrix (indexed by *source* frame) to an array
-        aligned with the sampled frames taken at `self.fps`. Values in `ant_raw`
-        are distances in *frames* at the source fps. We convert them to seconds or
-        minutes (per self.time_unit) using `src_fps`.
-        """
         L = total_frames - 1
         rows = []
 
@@ -516,17 +658,14 @@ class PegAndRing(Dataset):
                 total_frames=total_frames,
             )
 
-            # Guard the index and fetch the raw row (frame distances at src fps)
             src_idx = min(max(src_idx, 0), ant_raw.shape[0] - 1)
             raw_row = ant_raw[src_idx].astype(np.int64)
 
-            # Convert distances-in-frames -> seconds (then to minutes if requested)
             secs = np.empty(NUM_CLASSES, dtype=np.float64)
             for k, v in enumerate(raw_row):
                 if v == 0:
                     secs[k] = 0.0
                 elif v == L or v < 0:
-                    # Preserve sentinel meanings (end-of-video or invalid)
                     secs[k] = float(v)
                 else:
                     secs[k] = max(0.0, float(v) / max(src_fps, 1e-9))
@@ -535,23 +674,71 @@ class PegAndRing(Dataset):
             rows.append(vals)
 
         ant_unit = np.stack(rows, axis=0).astype(np.float32)
-        ant_unit[ant_unit < 0] = -1.0  # keep sentinel negatives consistent
+        ant_unit[ant_unit < 0] = -1.0
         np.save(cache_path, ant_unit)
         return ant_unit
 
     def __len__(self) -> int:
         return len(self.windows)
 
+    # --------- NEW: consistent window-level augmentation ----------
+    def _apply_consistent_transform(self, pil_images: List[Image.Image]) -> torch.Tensor:
+        """
+        Apply the same randomly-sampled augmentation parameters to all frames in a window
+        (temporal consistency). Returns a float tensor [T, 3, H, W] normalized.
+        """
+        # Resize all to a common size first
+        imgs = [img.resize(self.resize_size, Image.BILINEAR) for img in pil_images]
+
+        if self.use_train_aug:
+            # sample params once
+            do_hflip = random.random() < self.hflip_p
+            angle = random.uniform(-self.train_rotation, self.train_rotation)
+
+            # Color jitter factors
+            cj = self.train_color_jitter
+            b = 1.0 + random.uniform(-cj["brightness"], cj["brightness"])
+            c = 1.0 + random.uniform(-cj["contrast"], cj["contrast"])
+            s = 1.0 + random.uniform(-cj["saturation"], cj["saturation"])
+            h = random.uniform(-cj["hue"], cj["hue"])
+
+            # crop params from first frame (on resized image)
+            i, j, h_crop, w_crop = transforms.RandomCrop.get_params(
+                imgs[0], output_size=self.crop_size
+            )
+
+            out = []
+            for img in imgs:
+                if do_hflip:
+                    img = TF.hflip(img)
+                img = TF.rotate(img, angle, interpolation=TF.InterpolationMode.BILINEAR, expand=False)
+                # color jitter sequence: brightness -> contrast -> saturation -> hue
+                img = TF.adjust_brightness(img, b)
+                img = TF.adjust_contrast(img, c)
+                img = TF.adjust_saturation(img, s)
+                img = TF.adjust_hue(img, h)
+                img = TF.crop(img, top=i, left=j, height=h_crop, width=w_crop)
+                tens = TF.to_tensor(img)
+                tens = TF.normalize(tens, mean=self.mean.flatten().tolist(), std=self.std.flatten().tolist())
+                out.append(tens)
+            return torch.stack(out, dim=0)
+        else:
+            # eval path: deterministic center-crop
+            out = []
+            for img in imgs:
+                img = TF.center_crop(img, self.crop_size)
+                tens = TF.to_tensor(img)
+                tens = TF.normalize(tens, mean=self.mean.flatten().tolist(), std=self.std.flatten().tolist())
+                out.append(tens)
+            return torch.stack(out, dim=0)
+
     def __getitem__(self, idx: int):
         meta = copy.deepcopy(self.windows[idx])
 
-        frames = torch.stack(
-            [
-                self.transform(Image.open(f).convert("RGB"))
-                for f in meta["frames_filepath"]
-            ],
-            dim=0,
-        ).contiguous()
+        pil_frames = [
+            Image.open(f).convert("RGB") for f in meta["frames_filepath"]
+        ]
+        frames = self._apply_consistent_transform(pil_frames).contiguous()  # [T, 3, H, W]
 
         meta["frames_indexes"] = torch.asarray(meta["frames_indexes"], dtype=torch.long)
         meta["phase_label"] = torch.asarray(meta["phase_label"], dtype=torch.float32)
@@ -575,6 +762,11 @@ class PegAndRing(Dataset):
             np.asarray(meta["prev_anticipation"], dtype=np.float32)
         )
 
+        # convert precomputed completion scalar to torch tensor in [0,1]
+        meta["phase_completition"] = torch.tensor(
+            float(meta["phase_completition"]), dtype=torch.float32
+        )
+
         if (
             self.rgbd_mode
             and ("frames_depths" in meta)
@@ -587,6 +779,8 @@ class PegAndRing(Dataset):
                 ],
                 dim=0,
             )
+            # NOTE: if you want consistent augmentation for depths as well,
+            # integrate the same params into a depth pipeline here.
             depths = self.rgbd_transform(depths.unsqueeze(1)).squeeze(1)
             meta["depths"] = depths
             if self.add_depth_to_frames:
@@ -596,7 +790,7 @@ class PegAndRing(Dataset):
         return frames, meta
 
 
-# ------------------- New: Samplers that shuffle videos, not windows -------------------
+# ------------------- Samplers that shuffle videos, not windows -------------------
 
 
 class VideoSequentialSampler(Sampler[int]):
@@ -819,7 +1013,7 @@ if __name__ == "__main__":
     for i, (frames, meta) in enumerate(dataloader_B2):
         frames_idxs = meta["frames_indexes"]
         print(
-            f"Idx: {i}, batch_len={frames.shape[0]} frames_idxs={frames_idxs} video_name={meta['video_name']}"
+            f"Idx: {i}, batch_len={frames.shape[0]} frames_idxs={frames_idxs} video_name={meta['video_name']}, completion={meta['phase_completition'][:4]}"
         )
 
     # ----- Validation/Test sets (for counts) -----
