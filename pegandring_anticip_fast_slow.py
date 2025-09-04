@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # train_future_anticipation_transformer.py
 import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import time
 import random
@@ -22,10 +23,17 @@ import torch.nn.functional as F
 # ---- backbone (torchvision) ----
 try:
     import torchvision
-    from torchvision.models import resnet18, resnet50, ResNet18_Weights, ResNet50_Weights
+    from torchvision.models import (
+        resnet18,
+        resnet50,
+        ResNet18_Weights,
+        ResNet50_Weights,
+    )
+
     _HAS_TORCHVISION_WEIGHTS_ENUM = True
 except Exception:
     import torchvision  # type: ignore
+
     _HAS_TORCHVISION_WEIGHTS_ENUM = False
 
 
@@ -37,24 +45,26 @@ class TemporalConvBlock(nn.Module):
     Temporal convolutional block with residual connection and causal padding.
     Uses dilated convolutions for different receptive fields.
     """
+
     def __init__(
-        self, 
-        in_channels: int, 
-        out_channels: int, 
+        self,
+        in_channels: int,
+        out_channels: int,
         kernel_size: int = 3,
         dilation: int = 1,
         dropout: float = 0.1,
-        use_residual: bool = True
+        use_residual: bool = True,
     ):
         super().__init__()
         self.use_residual = use_residual and (in_channels == out_channels)
         self.pad = (kernel_size - 1) * dilation  # causal left padding
 
         self.conv1 = nn.Conv1d(
-            in_channels, out_channels, 
+            in_channels,
+            out_channels,
             kernel_size=kernel_size,
             dilation=dilation,
-            padding=0  # manual pad for causality
+            padding=0,  # manual pad for causality
         )
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=1)
 
@@ -66,7 +76,7 @@ class TemporalConvBlock(nn.Module):
         self.residual_proj = None
         if in_channels != out_channels:
             self.residual_proj = nn.Conv1d(in_channels, out_channels, 1)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, C, T]
@@ -97,12 +107,13 @@ class MultiScaleTemporalCNN(nn.Module):
     Multi-scale temporal CNN with different dilation rates to capture
     both short-term and long-term temporal dependencies.
     """
+
     def __init__(
         self,
         in_channels: int,
         hidden_channels: int = 256,
         num_layers: int = 4,
-        dropout: float = 0.1
+        dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -113,24 +124,30 @@ class MultiScaleTemporalCNN(nn.Module):
         # First layer
         self.layers.append(
             TemporalConvBlock(
-                in_channels, hidden_channels, 
-                kernel_size=3, dilation=dilations[0], 
-                dropout=dropout, use_residual=False
+                in_channels,
+                hidden_channels,
+                kernel_size=3,
+                dilation=dilations[0],
+                dropout=dropout,
+                use_residual=False,
             )
         )
         # Subsequent layers
         for i in range(1, num_layers):
             self.layers.append(
                 TemporalConvBlock(
-                    hidden_channels, hidden_channels,
-                    kernel_size=3, dilation=dilations[i],
-                    dropout=dropout, use_residual=True
+                    hidden_channels,
+                    hidden_channels,
+                    kernel_size=3,
+                    dilation=dilations[i],
+                    dropout=dropout,
+                    use_residual=True,
                 )
             )
         # Final projection
         self.final_proj = nn.Conv1d(hidden_channels, hidden_channels, 1)
         self.final_norm = nn.BatchNorm1d(hidden_channels)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, C, T]
@@ -147,20 +164,21 @@ class SpatialAttentionPool(nn.Module):
     """
     Spatial attention pooling for CNN features.
     """
+
     def __init__(self, in_channels: int):
         super().__init__()
         self.spatial_att = nn.Sequential(
             nn.Conv2d(in_channels, in_channels // 8, 1),
             nn.ReLU(),
             nn.Conv2d(in_channels // 8, 1, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        att = self.spatial_att(x)          # [B,1,H,W]
+        att = self.spatial_att(x)  # [B,1,H,W]
         x = x * att
-        x = self.global_pool(x).flatten(1) # [B,C]
+        x = self.global_pool(x).flatten(1)  # [B,C]
         return x
 
 
@@ -169,17 +187,20 @@ class GatedFusion(nn.Module):
     Gated lateral fusion for two temporal feature streams aligned in time.
     out = σ(Conv1d([A;B])) * A + (1-σ(...)) * B
     """
+
     def __init__(self, channels: int):
         super().__init__()
         self.gate = nn.Conv1d(2 * channels, channels, kernel_size=1)
         self.proj = nn.Conv1d(channels, channels, kernel_size=1)
         self.norm = nn.BatchNorm1d(channels)
 
-        nn.init.xavier_uniform_(self.gate.weight); nn.init.zeros_(self.gate.bias)
-        nn.init.xavier_uniform_(self.proj.weight); nn.init.zeros_(self.proj.bias)
+        nn.init.xavier_uniform_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([a, b], dim=1)     # [B,2C,T]
+        x = torch.cat([a, b], dim=1)  # [B,2C,T]
         g = torch.sigmoid(self.gate(x))  # [B,C,T]
         y = g * a + (1.0 - g) * b
         y = self.proj(y)
@@ -214,12 +235,24 @@ class ConvModule(nn.Module):
     """
     Conformer convolution module (temporal).
     """
-    def __init__(self, d_model: int, kernel_size: int = 3, dilation: int = 1, dropout: float = 0.1):
+
+    def __init__(
+        self,
+        d_model: int,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.pw1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
         self.dw = nn.Conv1d(
-            d_model, d_model, kernel_size=kernel_size,
-            groups=d_model, dilation=dilation, padding=0, bias=False
+            d_model,
+            d_model,
+            kernel_size=kernel_size,
+            groups=d_model,
+            dilation=dilation,
+            padding=0,
+            bias=False,
         )
         self.bn = nn.BatchNorm1d(d_model)
         self.pw2 = nn.Conv1d(d_model, d_model, kernel_size=1)
@@ -228,17 +261,19 @@ class ConvModule(nn.Module):
         self.dilation = dilation
         self.ln = nn.LayerNorm(d_model)
 
-        nn.init.xavier_uniform_(self.pw1.weight); nn.init.zeros_(self.pw1.bias)
+        nn.init.xavier_uniform_(self.pw1.weight)
+        nn.init.zeros_(self.pw1.bias)
         nn.init.xavier_uniform_(self.dw.weight)
-        nn.init.xavier_uniform_(self.pw2.weight); nn.init.zeros_(self.pw2.bias)
+        nn.init.xavier_uniform_(self.pw2.weight)
+        nn.init.zeros_(self.pw2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        x = self.ln(x)            # [B,T,D]
-        x = x.transpose(1, 2)     # [B,D,T]
+        x = self.ln(x)  # [B,T,D]
+        x = x.transpose(1, 2)  # [B,D,T]
 
         # GLU
-        x = self.pw1(x)           # [B,2D,T]
+        x = self.pw1(x)  # [B,2D,T]
         a, b = x.chunk(2, dim=1)
         x = a * torch.sigmoid(b)  # [B,D,T]
 
@@ -251,7 +286,7 @@ class ConvModule(nn.Module):
         x = F.gelu(x)
         x = self.pw2(x)
         x = self.dropout(x)
-        x = x.transpose(1, 2)     # [B,T,D]
+        x = x.transpose(1, 2)  # [B,T,D]
         return residual + x
 
 
@@ -269,7 +304,8 @@ class PositionwiseFFN(nn.Module):
         )
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.net(x)
@@ -279,11 +315,21 @@ class TemporalConformerBlock(nn.Module):
     """
     FFN -> Causal Self-Attention -> Conv Module -> FFN (with residuals)
     """
-    def __init__(self, d_model: int, num_heads: int = 8, kernel_size: int = 3, dilation: int = 1, dropout: float = 0.1):
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int = 8,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.ffn1 = PositionwiseFFN(d_model, expansion=4, dropout=dropout)
         self.attn = CausalSelfAttention(d_model, num_heads=num_heads, dropout=dropout)
-        self.conv = ConvModule(d_model, kernel_size=kernel_size, dilation=dilation, dropout=dropout)
+        self.conv = ConvModule(
+            d_model, kernel_size=kernel_size, dilation=dilation, dropout=dropout
+        )
         self.ffn2 = PositionwiseFFN(d_model, expansion=4, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -298,14 +344,28 @@ class TemporalConformerEncoder(nn.Module):
     """
     Stack of TemporalConformerBlock with increasing dilations for multi-scale context.
     """
-    def __init__(self, d_model: int, num_layers: int = 4, num_heads: int = 8, dropout: float = 0.1):
+
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         dilations = [2**i for i in range(num_layers)]  # match TCN philosophy
-        self.blocks = nn.ModuleList([
-            TemporalConformerBlock(
-                d_model=d_model, num_heads=num_heads, kernel_size=3, dilation=d, dropout=dropout
-            ) for d in dilations
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                TemporalConformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    kernel_size=3,
+                    dilation=d,
+                    dropout=dropout,
+                )
+                for d in dilations
+            ]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
@@ -314,7 +374,7 @@ class TemporalConformerEncoder(nn.Module):
 
 
 # -----------------------------
-# Slow-Fast Anticipation Model
+# Slow-Fast Anticipation Model (differentiable constraints)
 # -----------------------------
 class SlowFastTemporalAnticipation(nn.Module):
     """
@@ -322,6 +382,7 @@ class SlowFastTemporalAnticipation(nn.Module):
 
     Returns: anticipation [B,C], phase_logits [B,C], completion [B,1], {}
     """
+
     def __init__(
         self,
         sequence_length: int,
@@ -339,6 +400,10 @@ class SlowFastTemporalAnticipation(nn.Module):
         dropout: float = 0.1,
         use_spatial_attention: bool = True,
         attn_heads: int = 8,
+        # NEW: smoothness hyperparams
+        softmin_tau: float | None = None,  # default set from H if None
+        sigmoid_scale: float = 1.0,  # scale inside sigmoid, >1 = sharper
+        floor_beta: float = 2.0,  # beta for tiny softplus floor
     ):
         super().__init__()
 
@@ -346,6 +411,11 @@ class SlowFastTemporalAnticipation(nn.Module):
         self.C = num_classes
         self.H = time_horizon
         self.hidden_channels = hidden_channels
+
+        # smooth hyperparams
+        self.softmin_tau = softmin_tau if softmin_tau is not None else 0.02 * self.H
+        self.sigmoid_scale = sigmoid_scale
+        self.floor_beta = floor_beta
 
         # ---- Visual backbones (independent) ----
         self.backbone_fast_features, feat_dim_fast = self._make_backbone(
@@ -411,32 +481,37 @@ class SlowFastTemporalAnticipation(nn.Module):
             nn.Linear(hidden_channels // 2, num_classes),
         )
 
-        self.anticipation_query = nn.Parameter(torch.randn(1, 1, hidden_channels) * 0.02)
+        # Anticipation: remove final Softplus (we'll apply smooth constraints ourselves)
+        self.anticipation_query = nn.Parameter(
+            torch.randn(1, 1, hidden_channels) * 0.02
+        )
         self.temporal_attention_pool = nn.MultiheadAttention(
-            embed_dim=hidden_channels, num_heads=attn_heads, dropout=dropout, batch_first=True
+            embed_dim=hidden_channels,
+            num_heads=attn_heads,
+            dropout=dropout,
+            batch_first=True,
         )
         self.anticipation_head = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels // 2),
             nn.BatchNorm1d(hidden_channels // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_channels // 2, num_classes),
-            nn.Softplus(beta=1.0),  # positive outputs
+            nn.Linear(hidden_channels // 2, num_classes),  # no activation here
         )
 
+        # Completion stays as before (in [0,1])
         self.completion_head = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels // 2),
             nn.BatchNorm1d(hidden_channels // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_channels // 2, 1),
-            nn.Sigmoid(),  # [0,1]
+            nn.Sigmoid(),
         )
 
         self._init_weights()
 
     def reset_all_memory(self):
-        # no temporal cache — kept for API compatibility
         pass
 
     # ----- utils -----
@@ -455,16 +530,19 @@ class SlowFastTemporalAnticipation(nn.Module):
             feat_dim = 2048
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
-        feat = nn.Sequential(*list(bb.children())[:-2])  # remove avgpool+fc
+        features = nn.Sequential(*list(bb.children())[:-2])
         if freeze:
-            for p in feat.parameters():
+            for p in features.parameters():
                 p.requires_grad = False
-        return feat, feat_dim
+        return features, feat_dim
 
     def _init_weights(self):
         for module in [
-            self.feature_proj_fast, self.feature_proj_slow,
-            self.phase_head, self.anticipation_head, self.completion_head
+            self.feature_proj_fast,
+            self.feature_proj_slow,
+            self.phase_head,
+            self.anticipation_head,
+            self.completion_head,
         ]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
@@ -477,44 +555,49 @@ class SlowFastTemporalAnticipation(nn.Module):
             return pool(x)
         return pool(x).flatten(1)
 
+    @staticmethod
+    def _softmin(x: torch.Tensor, dim: int, tau: float) -> torch.Tensor:
+        # softmin_tau(x) = -tau * logsumexp(-x / tau)
+        return -tau * torch.logsumexp(-x / tau, dim=dim, keepdim=True)
+
     # ----- forward -----
     def forward(
         self,
         frames: torch.Tensor,
         meta: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        frames: [B, T, 3, H, W] (fast rate)
-        returns: anticipation [B,C], phase_logits [B,C], completion [B,1], {}
-        """
         B, T, C_in, H, W = frames.shape
         assert T == self.T, f"Expected sequence length {self.T}, got {T}"
 
         # Pathway sampling
-        frames_fast = frames  # [B,T,3,H,W]
+        frames_fast = frames
         idx_slow = torch.arange(0, T, 2, device=frames.device)
-        frames_slow = frames.index_select(1, idx_slow)  # [B,T_slow,3,H,W]
+        frames_slow = frames.index_select(1, idx_slow)
         T_slow = frames_slow.shape[1]
 
         # Fast features
         xf = frames_fast.view(B * T, C_in, H, W)
         with torch.set_grad_enabled(self.backbone_fast_features.training):
             sf = self.backbone_fast_features(xf)
-        vf = self._pool_spatial(self.spatial_pool_fast, sf)  # [B*T, Cf]
+        vf = self._pool_spatial(self.spatial_pool_fast, sf)
         vf_seq = vf.view(B, T, -1)
-        feats_fast = torch.stack([self.feature_proj_fast(vf_seq[:, t]) for t in range(T)], dim=2)  # [B,H,T]
+        feats_fast = torch.stack(
+            [self.feature_proj_fast(vf_seq[:, t]) for t in range(T)], dim=2
+        )  # [B,H,T]
 
         # Slow features
         xs = frames_slow.view(B * T_slow, C_in, H, W)
         with torch.set_grad_enabled(self.backbone_slow_features.training):
             ss = self.backbone_slow_features(xs)
-        vs = self._pool_spatial(self.spatial_pool_slow, ss)  # [B*T_slow, Cs]
+        vs = self._pool_spatial(self.spatial_pool_slow, ss)
         vs_seq = vs.view(B, T_slow, -1)
-        feats_slow = torch.stack([self.feature_proj_slow(vs_seq[:, t]) for t in range(T_slow)], dim=2)  # [B,H,T_slow]
+        feats_slow = torch.stack(
+            [self.feature_proj_slow(vs_seq[:, t]) for t in range(T_slow)], dim=2
+        )  # [B,H,T_slow]
 
         # Temporal TCNs
-        tf = self.temporal_cnn_fast(feats_fast)   # [B,H,T]
-        ts = self.temporal_cnn_slow(feats_slow)   # [B,H,T_slow]
+        tf = self.temporal_cnn_fast(feats_fast)  # [B,H,T]
+        ts = self.temporal_cnn_slow(feats_slow)  # [B,H,T_slow]
 
         # Align + fuse
         ts_up = F.interpolate(ts, size=T, mode="linear", align_corners=False)  # [B,H,T]
@@ -524,19 +607,31 @@ class SlowFastTemporalAnticipation(nn.Module):
         encoded = self.temporal_encoder(fused_fast.transpose(1, 2))  # [B,T,H]
 
         # Heads
-        current = encoded[:, -1, :]                   # [B,H]
-        phase_logits = self.phase_head(current)       # [B,C]
-        completion = self.completion_head(current)    # [B,1]
+        current = encoded[:, -1, :]  # [B,H]
+        phase_logits = self.phase_head(current)  # [B,C]
+        completion = self.completion_head(current)  # [B,1]
 
         # Anticipation via attention pooling
-        query = torch.as_tensor(self.anticipation_query, device=encoded.device).expand(B, -1, -1)
-        pooled, _ = self.temporal_attention_pool(query=query, key=encoded, value=encoded)  # [B,1,H]
-        pooled = pooled.squeeze(1)                    # [B,H]
-        anticipation_raw = self.anticipation_head(pooled)  # [B,C]
+        query = self.anticipation_query.expand(B, -1, -1)
+        pooled, _ = self.temporal_attention_pool(
+            query=query, key=encoded, value=encoded
+        )  # [B,1,H]
+        pooled = pooled.squeeze(1)  # [B,H]
+        raw = self.anticipation_head(pooled)  # [B,C] unconstrained logits
 
-        anticipation = torch.clamp(anticipation_raw, 0.0, self.H)
-        anticipation = anticipation - anticipation.min(dim=1, keepdim=True)[0]
-        anticipation = torch.clamp(anticipation, 0.0, self.H)
+        # ---- Differentiable constraints ----
+        # (1) Smoothly squash to (0, H): scaled sigmoid
+        if self.sigmoid_scale != 1.0:
+            y = self.H * torch.sigmoid(self.sigmoid_scale * raw)
+        else:
+            y = self.H * torch.sigmoid(raw)  # [B,C] in (0, H)
+
+        # (2) Soft-min centering so the (approx) minimum becomes 0
+        m = self._softmin(y, dim=1, tau=self.softmin_tau)  # [B,1]
+        y = y - m  # min ≈ 0, others ≥ 0, ≤ H
+
+        # (3) Tiny smooth floor (optional, keeps gradients near 0)
+        anticipation = F.softplus(y, beta=self.floor_beta)
 
         return anticipation, phase_logits, completion, {}
 
@@ -559,7 +654,7 @@ EPOCHS = 20
 LR = 3e-4
 WEIGHT_DECAY = 2e-4
 
-TIME_HORIZON = 1.0
+TIME_HORIZON = 2.0
 
 PRINT_EVERY = 40
 CKPT_PATH = Path("peg_and_ring_slowfast_transformer.pth")
@@ -646,13 +741,26 @@ def visualize_phase_timelines_classification(
         root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit
     )
 
-    gen = torch.Generator(); gen.manual_seed(SEED)
+    gen = torch.Generator()
+    gen.manual_seed(SEED)
     batch_sampler = VideoBatchSampler(
-        ds, batch_size=batch_size, batch_videos=False, shuffle_videos=False, generator=gen,
+        ds,
+        batch_size=batch_size,
+        batch_videos=False,
+        shuffle_videos=False,
+        generator=gen,
     )
-    loader = DataLoader(ds, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=False, drop_last=False)
+    loader = DataLoader(
+        ds,
+        batch_sampler=batch_sampler,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=False,
+    )
 
-    lengths: Dict[str, int] = {vn: ds.ant_cache[vn].shape[0] for vn in ds.ant_cache.keys()}
+    lengths: Dict[str, int] = {
+        vn: ds.ant_cache[vn].shape[0] for vn in ds.ant_cache.keys()
+    }
     preds: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     gts: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     for vn, N in lengths.items():
@@ -682,8 +790,22 @@ def visualize_phase_timelines_classification(
         valid = (pred_arr >= 0) & (gt_arr >= 0)
 
         fig, ax = plt.subplots(1, 1, figsize=(14, 4))
-        ax.step(x[valid], gt_arr[valid], where="post", linewidth=2, label="GT Phase", alpha=0.9)
-        ax.step(x[valid], pred_arr[valid], where="post", linewidth=2, label="Pred Phase", alpha=0.9)
+        ax.step(
+            x[valid],
+            gt_arr[valid],
+            where="post",
+            linewidth=2,
+            label="GT Phase",
+            alpha=0.9,
+        )
+        ax.step(
+            x[valid],
+            pred_arr[valid],
+            where="post",
+            linewidth=2,
+            label="Pred Phase",
+            alpha=0.9,
+        )
 
         ax.set_title(f"[{split}] Phase timeline — {vn}")
         ax.set_xlabel("Frame index (1 FPS)")
@@ -693,7 +815,9 @@ def visualize_phase_timelines_classification(
         ax.legend(loc="upper right")
 
         out_path = out_dir / f"{vn}_phase_timeline_{split}.png"
-        plt.tight_layout(); plt.savefig(out_path, dpi=150); plt.close(fig)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150)
+        plt.close(fig)
         print(f"[OK] Saved classification timeline -> {out_path}")
 
 
@@ -715,13 +839,26 @@ def visualize_anticipation_curves(
         root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit
     )
 
-    gen = torch.Generator(); gen.manual_seed(SEED)
+    gen = torch.Generator()
+    gen.manual_seed(SEED)
     batch_sampler = VideoBatchSampler(
-        ds, batch_size=batch_size, batch_videos=False, shuffle_videos=False, generator=gen,
+        ds,
+        batch_size=batch_size,
+        batch_videos=False,
+        shuffle_videos=False,
+        generator=gen,
     )
-    loader = DataLoader(ds, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=False, drop_last=False)
+    loader = DataLoader(
+        ds,
+        batch_sampler=batch_sampler,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=False,
+    )
 
-    lengths: Dict[str, int] = {vn: ds.ant_cache[vn].shape[0] for vn in ds.ant_cache.keys()}
+    lengths: Dict[str, int] = {
+        vn: ds.ant_cache[vn].shape[0] for vn in ds.ant_cache.keys()
+    }
     preds: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     gts: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     for vn, N in lengths.items():
@@ -733,7 +870,11 @@ def visualize_anticipation_curves(
         outputs, _, _, _ = model(frames, meta)
 
         pred = torch.clamp(outputs, min=0.0, max=time_horizon).detach().cpu().numpy()
-        gt = torch.clamp(meta["time_to_next_phase"], min=0.0, max=time_horizon).cpu().numpy()
+        gt = (
+            torch.clamp(meta["time_to_next_phase"], min=0.0, max=time_horizon)
+            .cpu()
+            .numpy()
+        )
 
         video_names = meta["video_name"]
         idx_last = meta["frames_indexes"][:, -1].cpu().numpy()
@@ -747,9 +888,12 @@ def visualize_anticipation_curves(
 
     unit_tag = time_unit.lower()
     for vn, N in lengths.items():
-        arr = preds[vn]; gt = gts[vn]
+        arr = preds[vn]
+        gt = gts[vn]
         valid = np.isfinite(arr).all(axis=1) & np.isfinite(gt).all(axis=1)
-        x = np.arange(N)[valid]; arr = arr[valid]; gt = gt[valid]
+        x = np.arange(N)[valid]
+        arr = arr[valid]
+        gt = gt[valid]
 
         fig, axs = plt.subplots(NUM_CLASSES, 1, sharex=True, figsize=(12, 12))
         y_upper = time_horizon * 1.05
@@ -762,15 +906,20 @@ def visualize_anticipation_curves(
             axs[i].set_ylim(0, y_upper)
 
         axs[-1].set_xlabel("Frame index (1 FPS)")
-        fig.suptitle(f"[{split}] Time to Next Phase — {vn} ({unit_tag}, horizon={time_horizon})")
+        fig.suptitle(
+            f"[{split}] Time to Next Phase — {vn} ({unit_tag}, horizon={time_horizon})"
+        )
 
         handles, labels = axs[0].get_legend_handles_labels()
         if handles:
             fig.legend(handles, labels, loc="upper right")
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        out_path = out_dir / f"{vn}_anticipation_{unit_tag}_h{time_horizon:g}_{split}.png"
-        plt.savefig(out_path, dpi=150); plt.close(fig)
+        out_path = (
+            out_dir / f"{vn}_anticipation_{unit_tag}_h{time_horizon:g}_{split}.png"
+        )
+        plt.savefig(out_path, dpi=150)
+        plt.close(fig)
         print(f"[OK] Saved anticipation curves -> {out_path}")
 
 
@@ -780,28 +929,70 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     # Datasets
-    train_ds = PegAndRing(ROOT_DIR, mode="train", seq_len=SEQ_LEN, stride=STRIDE, time_unit=TIME_UNIT, augment=True)
-    val_ds   = PegAndRing(ROOT_DIR, mode="val",   seq_len=SEQ_LEN, stride=STRIDE, time_unit=TIME_UNIT, augment=False)
-    test_ds  = PegAndRing(ROOT_DIR, mode="test",  seq_len=SEQ_LEN, stride=STRIDE, time_unit=TIME_UNIT, augment=False)
+    train_ds = PegAndRing(
+        ROOT_DIR,
+        mode="train",
+        seq_len=SEQ_LEN,
+        stride=STRIDE,
+        time_unit=TIME_UNIT,
+        augment=True,
+    )
+    val_ds = PegAndRing(
+        ROOT_DIR,
+        mode="val",
+        seq_len=SEQ_LEN,
+        stride=STRIDE,
+        time_unit=TIME_UNIT,
+        augment=False,
+    )
+    test_ds = PegAndRing(
+        ROOT_DIR,
+        mode="test",
+        seq_len=SEQ_LEN,
+        stride=STRIDE,
+        time_unit=TIME_UNIT,
+        augment=False,
+    )
 
     # Dataloaders
-    gen_train = torch.Generator(); gen_train.manual_seed(SEED)
+    gen_train = torch.Generator()
+    gen_train.manual_seed(SEED)
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=False, drop_last=False
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
+        drop_last=False,
     )
     global PRINT_EVERY
     PRINT_EVERY = len(train_loader) // 5
 
-    gen_eval = torch.Generator(); gen_eval.manual_seed(SEED)
+    gen_eval = torch.Generator()
+    gen_eval.manual_seed(SEED)
     val_loader = DataLoader(
         val_ds,
-        batch_sampler=VideoBatchSampler(val_ds, batch_size=BATCH_SIZE, batch_videos=False, shuffle_videos=False, generator=gen_eval),
-        num_workers=NUM_WORKERS, pin_memory=False,
+        batch_sampler=VideoBatchSampler(
+            val_ds,
+            batch_size=BATCH_SIZE,
+            batch_videos=False,
+            shuffle_videos=False,
+            generator=gen_eval,
+        ),
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
     )
     test_loader = DataLoader(
         test_ds,
-        batch_sampler=VideoBatchSampler(test_ds, batch_size=BATCH_SIZE, batch_videos=False, shuffle_videos=False, generator=gen_eval),
-        num_workers=NUM_WORKERS, pin_memory=False,
+        batch_sampler=VideoBatchSampler(
+            test_ds,
+            batch_size=BATCH_SIZE,
+            batch_videos=False,
+            shuffle_videos=False,
+            generator=gen_eval,
+        ),
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
     )
 
     # Model
@@ -816,7 +1007,7 @@ def main():
         freeze_backbone_fast=False,
         freeze_backbone_slow=False,
         hidden_channels=384,
-        num_temporal_layers=6,   # works now
+        num_temporal_layers=6,  # works now
         dropout=0.1,
         use_spatial_attention=True,
         attn_heads=8,
@@ -842,7 +1033,9 @@ def main():
                 frames = frames.to(device)
                 labels = meta["phase_label"].to(device).long()
                 complets_gt = meta["phase_completition"].to(device).float().unsqueeze(1)
-                ttnp = torch.clamp(meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON)
+                ttnp = torch.clamp(
+                    meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON
+                )
 
                 reg, logits, completion_pred, _ = model(frames, meta)
 
@@ -900,7 +1093,9 @@ def main():
             if val_stats["mae"] < best_val_mae:
                 best_val_mae = val_stats["mae"]
                 torch.save(model.state_dict(), CKPT_PATH)
-                print(f"✅  New best val_mae={best_val_mae:.4f} val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}")
+                print(
+                    f"✅  New best val_mae={best_val_mae:.4f} val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}"
+                )
 
     # Test + Visualizations
     if CKPT_PATH.exists():
@@ -917,14 +1112,24 @@ def main():
     model.reset_all_memory()
 
     visualize_phase_timelines_classification(
-        model=model, root_dir=ROOT_DIR, split="test", time_unit=TIME_UNIT,
-        batch_size=BATCH_SIZE, num_workers=min(6, NUM_WORKERS), out_dir=EVAL_CLS_DIR,
+        model=model,
+        root_dir=ROOT_DIR,
+        split="test",
+        time_unit=TIME_UNIT,
+        batch_size=BATCH_SIZE,
+        num_workers=min(6, NUM_WORKERS),
+        out_dir=EVAL_CLS_DIR,
     )
     model.reset_all_memory()
 
     visualize_anticipation_curves(
-        model=model, root_dir=ROOT_DIR, split="test", time_unit=TIME_UNIT,
-        time_horizon=TIME_HORIZON, batch_size=BATCH_SIZE, num_workers=min(6, NUM_WORKERS),
+        model=model,
+        root_dir=ROOT_DIR,
+        split="test",
+        time_unit=TIME_UNIT,
+        time_horizon=TIME_HORIZON,
+        batch_size=BATCH_SIZE,
+        num_workers=min(6, NUM_WORKERS),
         out_dir=EVAL_ANT_DIR,
     )
 
