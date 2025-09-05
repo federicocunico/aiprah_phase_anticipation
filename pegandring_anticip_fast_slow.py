@@ -651,7 +651,7 @@ BATCH_SIZE = 12
 NUM_WORKERS = 30
 EPOCHS = 20
 
-LR = 3e-4
+LR = 1e-4
 WEIGHT_DECAY = 2e-4
 
 TIME_HORIZON = 2.0
@@ -1020,7 +1020,7 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     # Training
-    if True:
+    if False:
         best_val_mae = float("inf")
         for epoch in range(1, EPOCHS + 1):
             model.train()
