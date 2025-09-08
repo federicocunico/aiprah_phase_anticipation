@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # train_future_anticipation_transformer.py
+import gc
 import os
-
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import time
 import random
 from pathlib import Path
-from typing import Dict, Any, DefaultDict, Optional, List, Tuple
+from typing import Dict, Any, DefaultDict, Optional, List, Tuple, Set
 from collections import defaultdict
 
 import numpy as np
@@ -117,7 +118,6 @@ class MultiScaleTemporalCNN(nn.Module):
     ):
         super().__init__()
 
-        # FIX: generate enough dilations for *all* layers (e.g., num_layers=6)
         dilations = [2**i for i in range(num_layers)]  # [1,2,4,8,...]
 
         self.layers = nn.ModuleList()
@@ -222,7 +222,6 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
-        # Causal mask (True = no attend)
         attn_mask = torch.ones(T, T, device=x.device, dtype=torch.bool).triu(1)
         residual = x
         x = self.ln(x)
@@ -272,12 +271,10 @@ class ConvModule(nn.Module):
         x = self.ln(x)  # [B,T,D]
         x = x.transpose(1, 2)  # [B,D,T]
 
-        # GLU
         x = self.pw1(x)  # [B,2D,T]
         a, b = x.chunk(2, dim=1)
         x = a * torch.sigmoid(b)  # [B,D,T]
 
-        # causal padding for depthwise conv
         pad = (self.kernel_size - 1) * self.dilation
         if pad > 0:
             x = F.pad(x, (pad, 0))
@@ -353,7 +350,7 @@ class TemporalConformerEncoder(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        dilations = [2**i for i in range(num_layers)]  # match TCN philosophy
+        dilations = [2**i for i in range(num_layers)]
         self.blocks = nn.ModuleList(
             [
                 TemporalConformerBlock(
@@ -400,10 +397,9 @@ class SlowFastTemporalAnticipation(nn.Module):
         dropout: float = 0.1,
         use_spatial_attention: bool = True,
         attn_heads: int = 8,
-        # NEW: smoothness hyperparams
-        softmin_tau: float | None = None,  # default set from H if None
-        sigmoid_scale: float = 1.0,  # scale inside sigmoid, >1 = sharper
-        floor_beta: float = 2.0,  # beta for tiny softplus floor
+        softmin_tau: float | None = None,
+        sigmoid_scale: float = 1.0,
+        floor_beta: float = 2.0,
     ):
         super().__init__()
 
@@ -412,7 +408,6 @@ class SlowFastTemporalAnticipation(nn.Module):
         self.H = time_horizon
         self.hidden_channels = hidden_channels
 
-        # smooth hyperparams
         self.softmin_tau = softmin_tau if softmin_tau is not None else 0.02 * self.H
         self.sigmoid_scale = sigmoid_scale
         self.floor_beta = floor_beta
@@ -481,7 +476,7 @@ class SlowFastTemporalAnticipation(nn.Module):
             nn.Linear(hidden_channels // 2, num_classes),
         )
 
-        # Anticipation: remove final Softplus (we'll apply smooth constraints ourselves)
+        # Anticipation via attention pooling
         self.anticipation_query = nn.Parameter(
             torch.randn(1, 1, hidden_channels) * 0.02
         )
@@ -496,10 +491,9 @@ class SlowFastTemporalAnticipation(nn.Module):
             nn.BatchNorm1d(hidden_channels // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_channels // 2, num_classes),  # no activation here
+            nn.Linear(hidden_channels // 2, num_classes),
         )
 
-        # Completion stays as before (in [0,1])
         self.completion_head = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels // 2),
             nn.BatchNorm1d(hidden_channels // 2),
@@ -510,9 +504,6 @@ class SlowFastTemporalAnticipation(nn.Module):
         )
 
         self._init_weights()
-
-    def reset_all_memory(self):
-        pass
 
     # ----- utils -----
     def _make_backbone(self, backbone: str, pretrained: bool, freeze: bool):
@@ -557,7 +548,6 @@ class SlowFastTemporalAnticipation(nn.Module):
 
     @staticmethod
     def _softmin(x: torch.Tensor, dim: int, tau: float) -> torch.Tensor:
-        # softmin_tau(x) = -tau * logsumexp(-x / tau)
         return -tau * torch.logsumexp(-x / tau, dim=dim, keepdim=True)
 
     # ----- forward -----
@@ -583,7 +573,7 @@ class SlowFastTemporalAnticipation(nn.Module):
         vf_seq = vf.view(B, T, -1)
         feats_fast = torch.stack(
             [self.feature_proj_fast(vf_seq[:, t]) for t in range(T)], dim=2
-        )  # [B,H,T]
+        )
 
         # Slow features
         xs = frames_slow.view(B * T_slow, C_in, H, W)
@@ -593,44 +583,37 @@ class SlowFastTemporalAnticipation(nn.Module):
         vs_seq = vs.view(B, T_slow, -1)
         feats_slow = torch.stack(
             [self.feature_proj_slow(vs_seq[:, t]) for t in range(T_slow)], dim=2
-        )  # [B,H,T_slow]
+        )
 
         # Temporal TCNs
-        tf = self.temporal_cnn_fast(feats_fast)  # [B,H,T]
-        ts = self.temporal_cnn_slow(feats_slow)  # [B,H,T_slow]
+        tf = self.temporal_cnn_fast(feats_fast)
+        ts = self.temporal_cnn_slow(feats_slow)
 
         # Align + fuse
-        ts_up = F.interpolate(ts, size=T, mode="linear", align_corners=False)  # [B,H,T]
-        fused_fast = self.fusion_gate_fast(tf, ts_up)  # [B,H,T]
+        ts_up = F.interpolate(ts, size=T, mode="linear", align_corners=False)
+        fused_fast = self.fusion_gate_fast(tf, ts_up)
 
         # Conformer temporal encoder
-        encoded = self.temporal_encoder(fused_fast.transpose(1, 2))  # [B,T,H]
+        encoded = self.temporal_encoder(fused_fast.transpose(1, 2))
 
         # Heads
-        current = encoded[:, -1, :]  # [B,H]
-        phase_logits = self.phase_head(current)  # [B,C]
-        completion = self.completion_head(current)  # [B,1]
+        current = encoded[:, -1, :]
+        phase_logits = self.phase_head(current)
+        completion = self.completion_head(current)
 
         # Anticipation via attention pooling
         query = self.anticipation_query.expand(B, -1, -1)
-        pooled, _ = self.temporal_attention_pool(
-            query=query, key=encoded, value=encoded
-        )  # [B,1,H]
-        pooled = pooled.squeeze(1)  # [B,H]
-        raw = self.anticipation_head(pooled)  # [B,C] unconstrained logits
+        pooled, _ = self.temporal_attention_pool(query=query, key=encoded, value=encoded)
+        pooled = pooled.squeeze(1)
+        raw = self.anticipation_head(pooled)
 
-        # ---- Differentiable constraints ----
-        # (1) Smoothly squash to (0, H): scaled sigmoid
         if self.sigmoid_scale != 1.0:
             y = self.H * torch.sigmoid(self.sigmoid_scale * raw)
         else:
-            y = self.H * torch.sigmoid(raw)  # [B,C] in (0, H)
+            y = self.H * torch.sigmoid(raw)
 
-        # (2) Soft-min centering so the (approx) minimum becomes 0
-        m = self._softmin(y, dim=1, tau=self.softmin_tau)  # [B,1]
-        y = y - m  # min ≈ 0, others ≥ 0, ≤ H
-
-        # (3) Tiny smooth floor (optional, keeps gradients near 0)
+        m = self._softmin(y, dim=1, tau=self.softmin_tau)
+        y = y - m
         anticipation = F.softplus(y, beta=self.floor_beta)
 
         return anticipation, phase_logits, completion, {}
@@ -649,7 +632,7 @@ STRIDE = 1
 
 BATCH_SIZE = 12
 NUM_WORKERS = 30
-EPOCHS = 20
+EPOCHS = 50
 
 LR = 1e-4
 WEIGHT_DECAY = 2e-4
@@ -658,12 +641,24 @@ TIME_HORIZON = 2.0
 
 PRINT_EVERY = 40
 CKPT_PATH = Path("peg_and_ring_slowfast_transformer.pth")
+LAST_CKPT_PATH = Path("peg_and_ring_slowfast_transformer_last.pth")  # resume point
+
+# control flags
+DO_TRAIN = False
+RESUME_IF_CRASH = True
 
 EVAL_ROOT = Path("results/eval_outputs_slowfast")
 EVAL_CLS_DIR = EVAL_ROOT / "classification"
 EVAL_ANT_DIR = EVAL_ROOT / "anticipation"
 EVAL_CLS_DIR.mkdir(parents=True, exist_ok=True)
 EVAL_ANT_DIR.mkdir(parents=True, exist_ok=True)
+
+# two-train-videos fit visualizations
+EVAL_TRAIN_FIT_ROOT = EVAL_ROOT / "train_fit"
+EVAL_TRAIN_CLS_TWO_DIR = EVAL_TRAIN_FIT_ROOT / "classification_two"
+EVAL_TRAIN_ANT_TWO_DIR = EVAL_TRAIN_FIT_ROOT / "anticipation_two"
+EVAL_TRAIN_CLS_TWO_DIR.mkdir(parents=True, exist_ok=True)
+EVAL_TRAIN_ANT_TWO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def set_seed(seed: int = 42):
@@ -674,7 +669,7 @@ def set_seed(seed: int = 42):
 
 
 # ---------------------------
-# Evaluation
+# Evaluation (unchanged)
 # ---------------------------
 @torch.no_grad()
 def evaluate(
@@ -722,7 +717,7 @@ def evaluate(
 
 
 # ---------------------------
-# Visualizations
+# Visualizations (added optional filter earlier)
 # ---------------------------
 @torch.no_grad()
 def visualize_phase_timelines_classification(
@@ -733,6 +728,7 @@ def visualize_phase_timelines_classification(
     batch_size: int = 64,
     num_workers: int = 6,
     out_dir: Path = EVAL_CLS_DIR,
+    video_filter: Optional[Set[str]] = None,
 ):
     device = next(model.parameters()).device
     model.eval()
@@ -758,9 +754,10 @@ def visualize_phase_timelines_classification(
         drop_last=False,
     )
 
-    lengths: Dict[str, int] = {
-        vn: ds.ant_cache[vn].shape[0] for vn in ds.ant_cache.keys()
-    }
+    all_keys = list(ds.ant_cache.keys())
+    keys = [vn for vn in all_keys if (video_filter is None or vn in video_filter)]
+
+    lengths: Dict[str, int] = {vn: ds.ant_cache[vn].shape[0] for vn in keys}
     preds: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     gts: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     for vn, N in lengths.items():
@@ -768,15 +765,20 @@ def visualize_phase_timelines_classification(
         gts[vn] = -np.ones(N, dtype=np.int32)
 
     for frames, meta in loader:
+        video_names = meta["video_name"]
+        if video_filter is not None and not any(vn in video_filter for vn in video_names):
+            continue
+
         frames = frames.to(device)
         _, logits, _, _ = model(frames, meta)
 
         pred_phase = logits.argmax(dim=1).detach().cpu().numpy()
-        video_names = meta["video_name"]
         idx_last = meta["frames_indexes"][:, -1].cpu().numpy()
         gt_phase = meta["phase_label"].cpu().numpy()
 
         for vn, idx, p, g in zip(video_names, idx_last, pred_phase, gt_phase):
+            if video_filter is not None and vn not in video_filter:
+                continue
             idx = int(idx)
             if 0 <= idx < preds[vn].shape[0]:
                 preds[vn][idx] = int(p)
@@ -788,24 +790,12 @@ def visualize_phase_timelines_classification(
         gt_arr = gts[vn]
         x = np.arange(N)
         valid = (pred_arr >= 0) & (gt_arr >= 0)
+        if not np.any(valid):
+            continue
 
         fig, ax = plt.subplots(1, 1, figsize=(14, 4))
-        ax.step(
-            x[valid],
-            gt_arr[valid],
-            where="post",
-            linewidth=2,
-            label="GT Phase",
-            alpha=0.9,
-        )
-        ax.step(
-            x[valid],
-            pred_arr[valid],
-            where="post",
-            linewidth=2,
-            label="Pred Phase",
-            alpha=0.9,
-        )
+        ax.step(x[valid], gt_arr[valid], where="post", linewidth=2, label="GT Phase", alpha=0.9)
+        ax.step(x[valid], pred_arr[valid], where="post", linewidth=2, label="Pred Phase", alpha=0.9)
 
         ax.set_title(f"[{split}] Phase timeline — {vn}")
         ax.set_xlabel("Frame index (1 FPS)")
@@ -831,6 +821,7 @@ def visualize_anticipation_curves(
     batch_size: int = 64,
     num_workers: int = 6,
     out_dir: Path = EVAL_ANT_DIR,
+    video_filter: Optional[Set[str]] = None,
 ):
     device = next(model.parameters()).device
     model.eval()
@@ -856,9 +847,10 @@ def visualize_anticipation_curves(
         drop_last=False,
     )
 
-    lengths: Dict[str, int] = {
-        vn: ds.ant_cache[vn].shape[0] for vn in ds.ant_cache.keys()
-    }
+    all_keys = list(ds.ant_cache.keys())
+    keys = [vn for vn in all_keys if (video_filter is None or vn in video_filter)]
+
+    lengths: Dict[str, int] = {vn: ds.ant_cache[vn].shape[0] for vn in keys}
     preds: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     gts: DefaultDict[str, np.ndarray] = defaultdict(lambda: None)
     for vn, N in lengths.items():
@@ -866,6 +858,10 @@ def visualize_anticipation_curves(
         gts[vn] = np.full((N, NUM_CLASSES), np.nan, dtype=np.float32)
 
     for frames, meta in loader:
+        video_names = meta["video_name"]
+        if video_filter is not None and not any(vn in video_filter for vn in video_names):
+            continue
+
         frames = frames.to(device)
         outputs, _, _, _ = model(frames, meta)
 
@@ -876,10 +872,11 @@ def visualize_anticipation_curves(
             .numpy()
         )
 
-        video_names = meta["video_name"]
         idx_last = meta["frames_indexes"][:, -1].cpu().numpy()
 
         for vn, idx, p_row, g_row in zip(video_names, idx_last, pred, gt):
+            if video_filter is not None and vn not in video_filter:
+                continue
             idx = int(idx)
             if 0 <= idx < preds[vn].shape[0]:
                 preds[vn][idx, :] = p_row
@@ -892,6 +889,8 @@ def visualize_anticipation_curves(
         gt = gts[vn]
         valid = np.isfinite(arr).all(axis=1) & np.isfinite(gt).all(axis=1)
         x = np.arange(N)[valid]
+        if x.size == 0:
+            continue
         arr = arr[valid]
         gt = gt[valid]
 
@@ -921,6 +920,185 @@ def visualize_anticipation_curves(
         plt.savefig(out_path, dpi=150)
         plt.close(fig)
         print(f"[OK] Saved anticipation curves -> {out_path}")
+
+
+# ---------------------------
+# Training (function) + resume-if-crash + CosineLR
+# ---------------------------
+def _save_last_checkpoint(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Optional[optim.lr_scheduler._LRScheduler],
+    epoch: int,
+    best_val_mae: float,
+    path: Path = LAST_CKPT_PATH,
+):
+    ckpt = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "best_val_mae": best_val_mae,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None,
+        },
+        "meta": {"epochs_total": EPOCHS, "time_horizon": TIME_HORIZON},
+    }
+    torch.save(ckpt, path)
+    print(f"💾 Saved last checkpoint (epoch {epoch}) -> {path}")
+
+
+def _try_resume(
+    model: nn.Module, optimizer: optim.Optimizer, scheduler, device: torch.device
+) -> Tuple[int, float]:
+    """
+    Returns (start_epoch, best_val_mae)
+    """
+    if RESUME_IF_CRASH and LAST_CKPT_PATH.exists():
+        try:
+            ckpt = torch.load(LAST_CKPT_PATH, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            if scheduler is not None and ckpt.get("scheduler_state") is not None:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+            best_mae = float(ckpt.get("best_val_mae", float("inf")))
+            rng = ckpt.get("rng_state", {})
+            # if "python" in rng:
+            #     random.setstate(rng["python"])
+            # if "numpy" in rng:
+            #     np.random.set_state(rng["numpy"])
+            # if "torch" in rng:
+            #     torch.set_rng_state(rng["torch"])
+            # if torch.cuda.is_available() and rng.get("cuda") is not None:
+            #     try:
+            #         torch.cuda.set_rng_state_all(rng["cuda"])
+            #     except Exception:
+            #         pass
+
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            print(
+                f"🔁 Resume enabled. Loaded last checkpoint at epoch {start_epoch-1} from {LAST_CKPT_PATH}"
+            )
+            return start_epoch, best_mae
+        except Exception as e:
+            print(f"⚠️  Failed to resume from {LAST_CKPT_PATH}: {e}")
+    return 1, float("inf")
+
+
+def train(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+):
+    # Losses / Optim
+    reg_loss = nn.SmoothL1Loss(reduction="mean")
+    ce_loss = nn.CrossEntropyLoss()
+    compl_loss = nn.SmoothL1Loss(beta=0.3)
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    # Cosine Annealing LR (epoch-level)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-6
+    )
+
+    # Resume if requested
+    start_epoch, best_val_mae = _try_resume(model, optimizer, scheduler, device)
+
+    for epoch in range(start_epoch, EPOCHS + 1):
+        model.train()
+        epoch_mae = epoch_ce = epoch_loss = epoch_acc = epoch_cmae = 0.0
+        seen = 0
+        t0 = time.time()
+
+        for it, (frames, meta) in enumerate(train_loader, start=1):
+            frames = frames.to(device)
+            labels = meta["phase_label"].to(device).long()
+            complets_gt = meta["phase_completition"].to(device).float().unsqueeze(1)
+            ttnp = torch.clamp(
+                meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON
+            )
+
+            reg, logits, completion_pred, _ = model(frames, meta)
+
+            loss_compl = compl_loss(completion_pred, complets_gt)
+            loss_cls = ce_loss(logits, labels)
+            loss_reg = reg_loss(reg, ttnp)
+            loss_total = loss_reg + loss_cls + loss_compl
+
+            optimizer.zero_grad(set_to_none=True)
+            loss_total.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                pred_cls = logits.argmax(dim=1)
+                train_mae = torch.mean(torch.abs(reg - ttnp))
+                train_acc = (pred_cls == labels).float().mean()
+                train_cmae = torch.mean(torch.abs(completion_pred - complets_gt))
+
+            bs = frames.size(0)
+            epoch_mae += float(train_mae.item()) * bs
+            epoch_ce += float(loss_cls.item()) * bs
+            epoch_loss += float(loss_total.item()) * bs
+            epoch_acc += float(train_acc.item()) * bs
+            epoch_cmae += float(train_cmae.item()) * bs
+            seen += bs
+
+            if it % PRINT_EVERY == 0:
+                cur_lr = scheduler.get_last_lr()[0]
+                print(
+                    f"[Epoch {epoch:02d} | it {it:04d}] "
+                    f"loss={loss_total.item():.4f} | mae={train_mae.item():.4f} | "
+                    f"acc={train_acc.item():.4f} | reg={loss_reg.item():.4f} | "
+                    f"cls={loss_cls.item():.4f} | compl={loss_compl.item():.4f} | lr={cur_lr:.2e}"
+                )
+
+        if epoch % 5 == 0:
+            print(f"GPU mem: {torch.cuda.memory_allocated() / 1e9:.4f}GB")
+            print(f"GPU cached: {torch.cuda.memory_reserved() / 1e9:.4f}GB")
+
+            # collect
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # step scheduler once per epoch
+        scheduler.step()
+
+        train_loss_avg = epoch_loss / max(1, seen)
+        train_mae_avg = epoch_mae / max(1, seen)
+        train_ce_avg = epoch_ce / max(1, seen)
+        train_acc_avg = epoch_acc / max(1, seen)
+        train_cmae_avg = epoch_cmae / max(1, seen)
+        print(
+            f"\nEpoch {epoch:02d} [{time.time()-t0:.1f}s] "
+            f"| train_loss={train_loss_avg:.4f} train_mae={train_mae_avg:.4f} "
+            f"train_ce={train_ce_avg:.4f} train_acc={train_acc_avg:.4f} "
+            f"train_compl_mae={train_cmae_avg:.4f}"
+        )
+
+        # Validation
+        val_stats = evaluate(model, val_loader, device, TIME_HORIZON)
+        print(
+            f"           val_mae={val_stats['mae']:.4f} val_ce={val_stats['ce']:.4f} "
+            f"val_acc={val_stats['acc']:.4f} val_compl_mae={val_stats['compl_mae']:.4f} "
+            f"| samples={val_stats['samples']}"
+        )
+
+        # Save best (unchanged)
+        if val_stats["mae"] < best_val_mae:
+            best_val_mae = val_stats["mae"]
+            torch.save(model.state_dict(), CKPT_PATH)
+            print(
+                f"✅  New best val_mae={best_val_mae:.4f} val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}"
+            )
+
+        # Always save last for resume (even if not best)
+        _save_last_checkpoint(model, optimizer, scheduler, epoch, best_val_mae, LAST_CKPT_PATH)
 
 
 def main():
@@ -1007,110 +1185,33 @@ def main():
         freeze_backbone_fast=False,
         freeze_backbone_slow=False,
         hidden_channels=384,
-        num_temporal_layers=6,  # works now
+        num_temporal_layers=6,
         dropout=0.1,
         use_spatial_attention=True,
         attn_heads=8,
     ).to(device)
 
-    # Losses / Optim
-    reg_loss = nn.SmoothL1Loss(reduction="mean")
-    ce_loss = nn.CrossEntropyLoss()
-    compl_loss = nn.SmoothL1Loss(beta=0.3)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
-    # Training
-    if False:
-        best_val_mae = float("inf")
-        for epoch in range(1, EPOCHS + 1):
-            model.train()
-            epoch_mae = epoch_ce = epoch_loss = epoch_acc = epoch_cmae = 0.0
-            seen = 0
-            t0 = time.time()
-            model.reset_all_memory()
-
-            for it, (frames, meta) in enumerate(train_loader, start=1):
-                frames = frames.to(device)
-                labels = meta["phase_label"].to(device).long()
-                complets_gt = meta["phase_completition"].to(device).float().unsqueeze(1)
-                ttnp = torch.clamp(
-                    meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON
-                )
-
-                reg, logits, completion_pred, _ = model(frames, meta)
-
-                loss_compl = compl_loss(completion_pred, complets_gt)
-                loss_cls = ce_loss(logits, labels)
-                loss_reg = reg_loss(reg, ttnp)
-                loss_total = loss_reg + loss_cls + loss_compl
-
-                optimizer.zero_grad(set_to_none=True)
-                loss_total.backward()
-                optimizer.step()
-
-                with torch.no_grad():
-                    pred_cls = logits.argmax(dim=1)
-                    train_mae = torch.mean(torch.abs(reg - ttnp))
-                    train_acc = (pred_cls == labels).float().mean()
-                    train_cmae = torch.mean(torch.abs(completion_pred - complets_gt))
-
-                bs = frames.size(0)
-                epoch_mae += float(train_mae.item()) * bs
-                epoch_ce += float(loss_cls.item()) * bs
-                epoch_loss += float(loss_total.item()) * bs
-                epoch_acc += float(train_acc.item()) * bs
-                epoch_cmae += float(train_cmae.item()) * bs
-                seen += bs
-
-                if it % PRINT_EVERY == 0:
-                    print(
-                        f"[Epoch {epoch:02d} | it {it:04d}] "
-                        f"loss={loss_total.item():.4f} | mae={train_mae.item():.4f} | "
-                        f"acc={train_acc.item():.4f} | reg={loss_reg.item():.4f} | "
-                        f"cls={loss_cls.item():.4f} | compl={loss_compl.item():.4f}"
-                    )
-
-            train_loss_avg = epoch_loss / max(1, seen)
-            train_mae_avg = epoch_mae / max(1, seen)
-            train_ce_avg = epoch_ce / max(1, seen)
-            train_acc_avg = epoch_acc / max(1, seen)
-            train_cmae_avg = epoch_cmae / max(1, seen)
-            print(
-                f"\nEpoch {epoch:02d} [{time.time()-t0:.1f}s] "
-                f"| train_loss={train_loss_avg:.4f} train_mae={train_mae_avg:.4f} "
-                f"train_ce={train_ce_avg:.4f} train_acc={train_acc_avg:.4f} "
-                f"train_compl_mae={train_cmae_avg:.4f}"
-            )
-
-            # Validation
-            val_stats = evaluate(model, val_loader, device, TIME_HORIZON)
-            print(
-                f"           val_mae={val_stats['mae']:.4f} val_ce={val_stats['ce']:.4f} "
-                f"val_acc={val_stats['acc']:.4f} val_compl_mae={val_stats['compl_mae']:.4f} "
-                f"| samples={val_stats['samples']}"
-            )
-
-            if val_stats["mae"] < best_val_mae:
-                best_val_mae = val_stats["mae"]
-                torch.save(model.state_dict(), CKPT_PATH)
-                print(
-                    f"✅  New best val_mae={best_val_mae:.4f} val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}"
-                )
+    # ---- Training (now controlled by DO_TRAIN) ----
+    if DO_TRAIN:
+        train(model, train_loader, val_loader, device)
 
     # Test + Visualizations
     if CKPT_PATH.exists():
         model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
         print(f"\nLoaded best model from: {CKPT_PATH}")
+    elif RESUME_IF_CRASH and LAST_CKPT_PATH.exists():
+        ckpt = torch.load(LAST_CKPT_PATH, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        print(f"\nLoaded last (resume) model from: {LAST_CKPT_PATH}")
 
-    model.reset_all_memory()
     test_stats = evaluate(model, test_loader, device, TIME_HORIZON)
     print(
         f"\nTEST — mae={test_stats['mae']:.4f} ce={test_stats['ce']:.4f} "
         f"acc={test_stats['acc']:.4f} compl_mae={test_stats['compl_mae']:.4f} "
         f"samples={test_stats['samples']}"
     )
-    model.reset_all_memory()
 
+    # Standard test-set visualizations
     visualize_phase_timelines_classification(
         model=model,
         root_dir=ROOT_DIR,
@@ -1120,7 +1221,6 @@ def main():
         num_workers=min(6, NUM_WORKERS),
         out_dir=EVAL_CLS_DIR,
     )
-    model.reset_all_memory()
 
     visualize_anticipation_curves(
         model=model,
@@ -1131,6 +1231,33 @@ def main():
         batch_size=BATCH_SIZE,
         num_workers=min(6, NUM_WORKERS),
         out_dir=EVAL_ANT_DIR,
+    )
+
+    # ---- Fit check on TWO training videos ----
+    train_video_names = sorted(list(train_ds.ant_cache.keys()))[:2]
+    video_filter = set(train_video_names)
+    print(f"\n[Train-Fit] Visualizing videos: {train_video_names}")
+
+    visualize_phase_timelines_classification(
+        model=model,
+        root_dir=ROOT_DIR,
+        split="train",
+        time_unit=TIME_UNIT,
+        batch_size=BATCH_SIZE,
+        num_workers=min(6, NUM_WORKERS),
+        out_dir=EVAL_TRAIN_CLS_TWO_DIR,
+        video_filter=video_filter,
+    )
+    visualize_anticipation_curves(
+        model=model,
+        root_dir=ROOT_DIR,
+        split="train",
+        time_unit=TIME_UNIT,
+        time_horizon=TIME_HORIZON,
+        batch_size=BATCH_SIZE,
+        num_workers=min(6, NUM_WORKERS),
+        out_dir=EVAL_TRAIN_ANT_TWO_DIR,
+        video_filter=video_filter,
     )
 
 
