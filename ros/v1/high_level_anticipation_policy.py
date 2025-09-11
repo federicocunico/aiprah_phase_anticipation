@@ -36,6 +36,7 @@ Config (ROS params, all optional):
        completion_smooth: str (default '/anticipation/completion_smooth')
 """
 
+from collections import deque
 import os
 import time
 from typing import List, Optional, Tuple
@@ -43,6 +44,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import rospy
 from std_msgs.msg import Int32, Float32, Float32MultiArray
+from decision_msgs.msg import Decision  # If gives error, remember to source from /home/saras/saras
 
 
 # -------------------------
@@ -59,7 +61,7 @@ class HighLevelPolicy:
       - TTNP = smoothed_reg[current_phase + 1] (or 0 at last phase)
     """
 
-    def __init__(self, num_classes: int, horizon_H: float, tau_seconds: float = 0.6, start_phase: int = 0):
+    def __init__(self, num_classes: int, horizon_H: float, tau_seconds: float = 0.6, start_phase: int = 0, phase_transition_patience: int = 16):
         self.C = int(num_classes)
         self.H = float(horizon_H)
         self.tau = float(tau_seconds)
@@ -69,6 +71,11 @@ class HighLevelPolicy:
         self.current_phase: int = self.start_phase
         self.seen_phase0: bool = False
         self.last_time: Optional[float] = None
+
+        self.phase_transition_patience = phase_transition_patience
+        self.phase_buffer = deque(maxlen=self.phase_transition_patience)  # each prediction is a window -> 16 windows
+
+        self._phase_buffer_ready = False
 
     def reset(self):
         self.smoothed_reg = None
@@ -105,19 +112,31 @@ class HighLevelPolicy:
 
         # --- Candidate phase from smoothed reg ---
         candidate_phase = int(np.argmin(self.smoothed_reg))
+        self.phase_buffer.append(candidate_phase)
+        phase_changed = False
 
-        # --- Constraints ---
-        if not self.seen_phase0:
-            # Clamp to 0 until phase 0 is observed once
-            if candidate_phase == 0:
-                self.seen_phase0 = True
-                self.current_phase = 0
-            else:
-                self.current_phase = 0
+        if len(self.phase_buffer) < self.phase_transition_patience:
+            self.current_phase = 0
+            if not self._phase_buffer_ready:
+                rospy.loginfo(f"Phase buffer filling... {len(self.phase_buffer)}/{self.phase_transition_patience}")
         else:
-            # Monotonic non-decreasing
-            if candidate_phase >= self.current_phase:
-                self.current_phase = candidate_phase
+            if not self._phase_buffer_ready:
+                self._phase_buffer_ready = True
+            candidate_phase = int(np.round(np.mean(list(self.phase_buffer))).item())
+
+            # --- Constraints ---
+            if not self.seen_phase0:
+                # Clamp to 0 until phase 0 is observed once
+                if candidate_phase == 0:
+                    self.seen_phase0 = True
+                    self.current_phase = 0
+                else:
+                    self.current_phase = 0
+            else:
+                # Monotonic non-decreasing
+                if candidate_phase >= self.current_phase:
+                    self.current_phase = candidate_phase
+                    phase_changed = True
 
         # --- TTNP from next phase's smoothed reg ---
         if self.current_phase >= self.C - 1:
@@ -126,7 +145,7 @@ class HighLevelPolicy:
             ttnp = float(self.smoothed_reg[self.current_phase + 1])
 
         self.last_time = now
-        return self.current_phase, self.smoothed_reg.copy(), ttnp
+        return self.current_phase, self.smoothed_reg.copy(), ttnp, phase_changed
 
 
 # -------------------------
@@ -154,12 +173,36 @@ class EMA1D:
         self.last_time = now
         return float(self.value)
 
+BUFFER_PUB_QUEUE = 1
+
+# INPUT
+ANTICIP_REGRESSION_TOPIC = "/anticipation/regression"
+ANTICIP_PHASE_TOPIC = "/anticipation/phase"
+ANTICIP_COMPLETION_TOPIC = "/anticipation/completion"
+
+# OUTPUT
+SMOOTHED_REGRESSION_TOPIC = "/anticipation/anticip_smooth"
+SMOOTHED_PHASE_TOPIC = "/anticipation/phase_smooth"
+SMOOTHED_COMPLETION_TOPIC = "/anticipation/completion_smooth"
+SMOOTHED_TTNP = "/anticipation/ttnp"
+
+# FSM 
+FSM_RIGHT_STATE_DECISION_TOPIC = "/mesa_right/fsm_state_decision"
+FSM_LEFT_STATE_DECISION_TOPIC = "/mesa_left/fsm_state_decision"
+
 
 # -------------------------
 # ROS Node
 # -------------------------
 class HighLevelPolicyNode:
-    def __init__(self):
+    def __init__(self,
+                 horizon_h=2.0,
+                 start_phase=0,
+                 *,
+                 tau_seconds=0.6,
+                 smooth_completion=True
+
+                 ):
         # Allow overriding ROS_MASTER_URI default used in your environment
         if "ROS_MASTER_URI" not in os.environ or "localhost" in os.environ.get("ROS_MASTER_URI", ""):
             rospy.loginfo("Setting default ROS MASTER to James")
@@ -168,22 +211,21 @@ class HighLevelPolicyNode:
         rospy.init_node("anticipation_policy_node", anonymous=False)
 
         # --- Params ---
-        self.tau_seconds = rospy.get_param("~tau_seconds", 0.6)
-        self.start_phase = int(rospy.get_param("~start_phase", 0))
-        self.horizon_H = float(rospy.get_param("~horizon_H", 2.0))
+        self.tau_seconds = tau_seconds
+        self.start_phase = start_phase
+        self.horizon_H = horizon_h
 
-        self.smooth_completion = bool(rospy.get_param("~smooth_completion", False))
-        self.compl_tau_seconds = float(rospy.get_param("~completion_tau_seconds", self.tau_seconds))
+        self.smooth_completion = smooth_completion
+        self.compl_tau_seconds = tau_seconds
 
-        topics = rospy.get_param("~topics", {})
-        self.topic_reg_in = topics.get("regression", "/anticipation/regression")
-        self.topic_phase_in = topics.get("phase", "/anticipation/phase")
-        self.topic_completion_in = topics.get("completion", "/anticipation/completion")
+        self.topic_reg_in = ANTICIP_REGRESSION_TOPIC
+        self.topic_phase_in = ANTICIP_PHASE_TOPIC
+        self.topic_completion_in = ANTICIP_COMPLETION_TOPIC
 
-        self.topic_anticip_out = topics.get("anticip_smooth", "/anticipation/anticip_smooth")
-        self.topic_phase_out = topics.get("phase_smooth", "/anticipation/phase_smooth")
-        self.topic_ttnp_out = topics.get("ttnp", "/anticipation/ttnp")
-        self.topic_completion_out = topics.get("completion_smooth", "/anticipation/completion_smooth")
+        self.topic_anticip_out = SMOOTHED_REGRESSION_TOPIC
+        self.topic_phase_out = SMOOTHED_PHASE_TOPIC
+        self.topic_ttnp_out = SMOOTHED_TTNP
+        self.topic_completion_out = SMOOTHED_COMPLETION_TOPIC
 
         # --- State ---
         self.C: Optional[int] = None
@@ -191,20 +233,23 @@ class HighLevelPolicyNode:
         self.compl_ema: Optional[EMA1D] = EMA1D(self.compl_tau_seconds) if self.smooth_completion else None
 
         # --- Publishers ---
-        self.pub_anticip = rospy.Publisher(self.topic_anticip_out, Float32MultiArray, queue_size=10)
-        self.pub_phase = rospy.Publisher(self.topic_phase_out, Int32, queue_size=10)
-        self.pub_ttnp = rospy.Publisher(self.topic_ttnp_out, Float32, queue_size=10)
+        self.pub_anticip = rospy.Publisher(self.topic_anticip_out, Float32MultiArray, queue_size=BUFFER_PUB_QUEUE)
+        self.pub_phase = rospy.Publisher(self.topic_phase_out, Int32, queue_size=BUFFER_PUB_QUEUE)
+        self.pub_ttnp = rospy.Publisher(self.topic_ttnp_out, Float32, queue_size=BUFFER_PUB_QUEUE)
         self.pub_completion = None
         if self.smooth_completion:
-            self.pub_completion = rospy.Publisher(self.topic_completion_out, Float32, queue_size=10)
+            self.pub_completion = rospy.Publisher(self.topic_completion_out, Float32, queue_size=BUFFER_PUB_QUEUE)
 
         # --- Subscribers ---
         # NOTE: regression drives the policy; phase/completion are optional inputs.
-        self.sub_reg = rospy.Subscriber(self.topic_reg_in, Float32MultiArray, self.cb_regression, queue_size=10)
-        self.sub_phase = rospy.Subscriber(self.topic_phase_in, Int32, self.cb_phase, queue_size=10)
-        self.sub_completion = rospy.Subscriber(self.topic_completion_in, Float32, self.cb_completion, queue_size=10)
+        self.sub_reg = rospy.Subscriber(self.topic_reg_in, Float32MultiArray, self.cb_regression, queue_size=BUFFER_PUB_QUEUE)
+        self.sub_phase = rospy.Subscriber(self.topic_phase_in, Int32, self.cb_phase, queue_size=BUFFER_PUB_QUEUE)
+        self.sub_completion = rospy.Subscriber(self.topic_completion_in, Float32, self.cb_completion, queue_size=BUFFER_PUB_QUEUE)
 
         self.last_raw_phase: Optional[int] = None  # informative only (from /anticipation/phase)
+
+        self.pub_fsm_left = rospy.Publisher(FSM_LEFT_STATE_DECISION_TOPIC, Decision, queue_size=BUFFER_PUB_QUEUE)
+        self.pub_fsm_right = rospy.Publisher(FSM_RIGHT_STATE_DECISION_TOPIC, Decision, queue_size=BUFFER_PUB_QUEUE)
 
         rospy.loginfo("[anticipation_policy_node] Ready. Subscribed to RAW topics.")
 
@@ -245,17 +290,23 @@ class HighLevelPolicyNode:
         reg_np = np.asarray(reg_list, dtype=np.float32)
 
         # --- Run policy ---
-        phase_proc, reg_smooth, ttnp = self.policy.update(reg_np, now)
+        phase_proc, reg_smooth, ttnp_norm, phase_trigger = self.policy.update(reg_np, now)
+        ttnp_seconds = ttnp_norm * 60
 
         # --- Publish processed outputs ---
         out_reg = Float32MultiArray(data=reg_smooth.astype(np.float32).tolist())
         self.pub_anticip.publish(out_reg)
         self.pub_phase.publish(Int32(data=int(phase_proc)))
-        self.pub_ttnp.publish(Float32(data=float(ttnp)))
+        self.pub_ttnp.publish(Float32(data=float(ttnp_seconds)))
 
         # (Optional) also emit completion EMA aligned with regression ticks
         if self.smooth_completion and self.compl_ema is not None and self.pub_completion is not None and self.compl_ema.value is not None:
             self.pub_completion.publish(Float32(data=float(self.compl_ema.value)))
+
+        if phase_trigger:
+            cmd = f"TRIGGER_PHASE{phase_proc}"
+            self.pub_fsm_left.publish(Decision(target=f"LEFT_{cmd}",confidence=1.0))
+            self.pub_fsm_right.publish(Decision(target=f"RIGHT_{cmd}",confidence=1.0))
 
     def spin(self):
         rospy.spin()
