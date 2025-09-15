@@ -412,4 +412,3 @@ class TemporalCNNAnticipation(nn.Module):
             return anticipation, phase_logits, aux
 
         return anticipation, phase_logits
-

@@ -379,7 +379,7 @@ class SlowFastTemporalAnticipation(nn.Module):
         dropout: float = 0.1,
         use_spatial_attention: bool = True,
         attn_heads: int = 8,
-        softmin_tau: float | None = None,
+        softmin_tau: Optional[float] = None,
         sigmoid_scale: float = 1.0,
         floor_beta: float = 2.0,
     ):
