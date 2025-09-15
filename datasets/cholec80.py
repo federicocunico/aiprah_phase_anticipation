@@ -37,34 +37,114 @@ phase_dict_key = [
 for i in range(len(phase_dict_key)):
     phase_dict[phase_dict_key[i]] = i
 
+import os
+import glob
+import shutil
+import subprocess
+from typing import Optional
+
+import cv2
+from tqdm import tqdm
+
+# assume you already have a `crop` function that returns a callable
+# def crop(img): ...
+
+
+def _has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def _extract_with_opencv(video_path: str, target_fps: int, output_dir: str) -> None:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    orig_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not orig_fps or orig_fps <= 0:
+        # Fallback if FPS metadata is missing; treat as 30 fps
+        orig_fps = 30.0
+
+    # Time-accumulator approach gives accurate sampling even when fps ratios are not integer
+    next_sample_t = 0.0
+    sample_dt = 1.0 / max(1, target_fps)
+    frame_idx = 0
+    saved_idx = 0
+
+    pbar = tqdm(desc="Extracting frames (OpenCV)", unit="f")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        t = frame_idx / orig_fps
+        if t + 1e-9 >= next_sample_t:
+            saved_idx += 1
+            out_path = os.path.join(output_dir, f"{saved_idx:06d}.jpg")
+            cv2.imwrite(out_path, frame)
+            next_sample_t += sample_dt
+        frame_idx += 1
+        pbar.update(1)
+    pbar.close()
+    cap.release()
+
 
 def subsample_video(video_path: str, target_fps: int, output_dir: str):
     """
-    Subsample video frames at a given target_fps with rescale to 224x224 using ffmpeg. Saved as 1.zfill(6).jpg
+    Subsample video frames at a given target_fps. If ffmpeg is available, use it;
+    otherwise fall back to OpenCV. Then crop borders with `crop(first_frame)` and
+    resize to 250x250. Frames are saved as %06d.jpg.
     """
     RESIZE_WIDTH = 250
-    RESIZE_HEIGHT = 250
+    RESIZE_HEIGHT = (
+        250  # kept for clarity, we resize to square (RESIZE_WIDTH x RESIZE_WIDTH)
+    )
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    cmd = f'ffmpeg -i {video_path} -vf "fps={target_fps}" {output_dir}/%06d.jpg'
-    os.system(cmd)
+    if _has_ffmpeg():
+        # Use ffmpeg for fast extraction
+        # -hide_banner/-loglevel reduce noise; -y overwrites if re-running
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            video_path,
+            "-vf",
+            f"fps={target_fps}",
+            os.path.join(output_dir, "%06d.jpg"),
+        ]
+        subprocess.run(cmd, check=True)
+    else:
+        # Fallback: OpenCV-based extraction
+        _extract_with_opencv(video_path, target_fps, output_dir)
 
-    frames = glob.glob(os.path.join(output_dir, "*.jpg"))
-    frames.sort()
+    # Post-process: crop + resize
+    frames = sorted(glob.glob(os.path.join(output_dir, "*.jpg")))
+    if not frames:
+        raise RuntimeError(
+            "No frames were extracted; check the input video and target_fps."
+        )
 
     first_frame = cv2.imread(frames[0])
+    if first_frame is None:
+        raise RuntimeError(f"Failed to read first extracted frame: {frames[0]}")
+
     lambda_crop = crop(first_frame)
 
-    for i, frame_path in tqdm(enumerate(frames), desc="Cropping & Resizing"):
+    for frame_path in tqdm(frames, desc="Cropping & Resizing"):
         frame = cv2.imread(frame_path)
+        if frame is None:
+            continue
+
+        # Skip if already the target size and square
         if frame.shape[0] == frame.shape[1] == RESIZE_WIDTH:
             continue
 
         # crop black borders
         frame = lambda_crop(frame)
-        # resize to resize width x resize height
+        # resize to square
         frame = cv2.resize(frame, (RESIZE_WIDTH, RESIZE_WIDTH))
         # save the frame
         cv2.imwrite(frame_path, frame)
@@ -131,7 +211,14 @@ def load_annotation(annotation_path: str, subsample_fps: int) -> np.ndarray:
 
 
 class Cholec80Dataset(Dataset):
-    def __init__(self, root_dir: str, mode: str = "train", seq_len: int = 10, fps: int = 1, rgbd: bool = False):
+    def __init__(
+        self,
+        root_dir: str,
+        mode: str = "train",
+        seq_len: int = 10,
+        fps: int = 1,
+        rgbd: bool = False,
+    ):
         super(Cholec80Dataset, self).__init__()
 
         self.root_dir = root_dir
@@ -149,7 +236,10 @@ class Cholec80Dataset(Dataset):
                 ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
                 RandomRotation(5),
                 transforms.ToTensor(),
-                transforms.Normalize([0.41757566, 0.26098573, 0.25888634], [0.21938758, 0.1983, 0.19342837]),
+                transforms.Normalize(
+                    [0.41757566, 0.26098573, 0.25888634],
+                    [0.21938758, 0.1983, 0.19342837],
+                ),
             ]
         )
 
@@ -158,7 +248,10 @@ class Cholec80Dataset(Dataset):
                 Resize((250, 250)),
                 CenterCrop(224),
                 transforms.ToTensor(),
-                transforms.Normalize([0.41757566, 0.26098573, 0.25888634], [0.21938758, 0.1983, 0.19342837]),
+                transforms.Normalize(
+                    [0.41757566, 0.26098573, 0.25888634],
+                    [0.21938758, 0.1983, 0.19342837],
+                ),
             ]
         )
 
@@ -237,8 +330,13 @@ class Cholec80Dataset(Dataset):
             self.transform = self.test_transform
             self.rgbd_transform = self.test_rgbd_transform
 
-        self.video_paths = [f"{self.root_dir}/videos/video{idx:02d}.mp4" for idx in video_idxs]
-        self.label_paths = [f"{self.root_dir}/phase_annotations/video{idx:02d}-phase.txt" for idx in video_idxs]
+        self.video_paths = [
+            f"{self.root_dir}/videos/video{idx:02d}.mp4" for idx in video_idxs
+        ]
+        self.label_paths = [
+            f"{self.root_dir}/phase_annotations/video{idx:02d}-phase.txt"
+            for idx in video_idxs
+        ]
         num_videos = len(self.video_paths)
         downsampled_dir = f"{self.root_dir}/downsampled_fps={self.target_fps}"
 
@@ -260,7 +358,9 @@ class Cholec80Dataset(Dataset):
             video_path = self.video_paths[i]
             annotation_path = self.label_paths[i]
             assert os.path.exists(video_path), f"Video file {video_path} does not exist"
-            assert os.path.exists(annotation_path), f"Label file {annotation_path} does not exist"
+            assert os.path.exists(
+                annotation_path
+            ), f"Label file {annotation_path} does not exist"
             video_name = video_path.split(os.sep)[-1].replace(".mp4", "")
             # calculate the number of frames in the video
             cap = cv2.VideoCapture(video_path)
@@ -275,8 +375,13 @@ class Cholec80Dataset(Dataset):
             frame_names = glob.glob(os.path.join(curr_downsampled_dir, "*.jpg"))
             frame_names.sort()
 
-            if not os.path.exists(curr_downsampled_dir) or len(frame_names) != expected_num_frames:
-                print(f"Video frames not downsampled. Subsampling now... {video_path.split('/')[-1]}")
+            if (
+                not os.path.exists(curr_downsampled_dir)
+                or len(frame_names) != expected_num_frames
+            ):
+                print(
+                    f"Video frames not downsampled. Subsampling now... {video_path.split('/')[-1]}"
+                )
                 if os.path.exists(curr_downsampled_dir):
                     shutil.rmtree(curr_downsampled_dir)
                 os.makedirs(curr_downsampled_dir)
@@ -287,7 +392,9 @@ class Cholec80Dataset(Dataset):
             self.video_paths_frames[video_name] = frame_names
             anns = self.video_annotations[video_name]
             if len(anns) != len(frame_names):
-                assert len(anns) > len(frame_names), f"Number of annotations is less than number of frames"
+                assert len(anns) > len(
+                    frame_names
+                ), f"Number of annotations is less than number of frames"
                 anns = anns[: len(frame_names)]
             self.video_annotations[video_name] = anns
 
@@ -295,16 +402,26 @@ class Cholec80Dataset(Dataset):
         self.F_steps = 10  # number of future steps to predict
         self.F_sampling = 60  # every 60 ticks (1 minute)
         self.windows = []
-        for video_name, frame_names in tqdm(self.video_paths_frames.items(), desc="Creating windows"):
+        for video_name, frame_names in tqdm(
+            self.video_paths_frames.items(), desc="Creating windows"
+        ):
             windows = []
-            all_ph_trans_time = torch.asarray(self.phase_transition_time[video_name])  # [NUM_CLASSES, NUM_FRAMES]
+            all_ph_trans_time = torch.asarray(
+                self.phase_transition_time[video_name]
+            )  # [NUM_CLASSES, NUM_FRAMES]
 
             for i in range(len(frame_names) - self.seq_len):
                 frame_window = frame_names[i : i + self.seq_len]
-                all_frame_labels = self.video_annotations[video_name][i : i + self.seq_len]
+                all_frame_labels = self.video_annotations[video_name][
+                    i : i + self.seq_len
+                ]
 
-                _unsubsampled_frame_n, frame_label = all_frame_labels[-1]  # label for the last frame in the window
-                frame_indexes = [int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window]
+                _unsubsampled_frame_n, frame_label = all_frame_labels[
+                    -1
+                ]  # label for the last frame in the window
+                frame_indexes = [
+                    int(f.split("/")[-1].replace(".jpg", "")) for f in frame_window
+                ]
                 ph_trans_time_dense = all_ph_trans_time[:, frame_indexes]
                 ph_trans_time = ph_trans_time_dense[:, -1]
 
@@ -312,14 +429,18 @@ class Cholec80Dataset(Dataset):
                 # targets_future = create_future_classification_targets(
                 #     all_ph_trans_time, self.seq_len, self.F_steps, self.F_sampling, i
                 # )  # [T, F, NUM_CLASSES]
-                targets_future = torch.zeros((self.seq_len, self.F_steps, 7), dtype=torch.int64)
+                targets_future = torch.zeros(
+                    (self.seq_len, self.F_steps, 7), dtype=torch.int64
+                )
                 # print("elapsed", time.time() - t)
 
                 ## Test with depths
                 depths_window = copy.deepcopy(frame_window)  # [T] list of str
                 for j in range(len(depths_window)):
                     depths_window[j] = (
-                        depths_window[j].replace("downsampled_fps=1", "downsampled_fps=1_DAM2").replace(".jpg", ".npy")
+                        depths_window[j]
+                        .replace("downsampled_fps=1", "downsampled_fps=1_DAM2")
+                        .replace(".jpg", ".npy")
                     )
                 ####
 
@@ -328,9 +449,15 @@ class Cholec80Dataset(Dataset):
                         "video_name": video_name,  # str
                         "frames_filepath": frame_window,  # [T] list of str
                         "frames_depths": depths_window,  # [T] list of str
-                        "frames_indexes": torch.asarray(frame_indexes),  # [T] list of int
-                        "phase_label": torch.asarray(frame_label),  # int (label for the last frame in the window)
-                        "phase_label_dense": torch.asarray([f[1] for f in all_frame_labels]),  # [T] list of int
+                        "frames_indexes": torch.asarray(
+                            frame_indexes
+                        ),  # [T] list of int
+                        "phase_label": torch.asarray(
+                            frame_label
+                        ),  # int (label for the last frame in the window)
+                        "phase_label_dense": torch.asarray(
+                            [f[1] for f in all_frame_labels]
+                        ),  # [T] list of int
                         "time_to_next_phase_dense": ph_trans_time_dense,  # [NUM_CLASSES, T] list of float; time to next phase for each frame
                         "time_to_next_phase": ph_trans_time,  # [NUM_CLASSES] list of float; time to next phase for the last frame
                         "future_targets": targets_future,  # [T, F, NUM_CLASSES] list of int; targets for classification
@@ -355,23 +482,36 @@ class Cholec80Dataset(Dataset):
         else:
             phase_results = {}
 
-            for video_name, annotations in tqdm(self.video_annotations.items(), desc="Computing phase annotations"):
-                phases = [phase for _, phase in annotations]  # Extract phase annotations
+            for video_name, annotations in tqdm(
+                self.video_annotations.items(), desc="Computing phase annotations"
+            ):
+                phases = [
+                    phase for _, phase in annotations
+                ]  # Extract phase annotations
                 num_frames = len(phases)
-                phase_lists = defaultdict(lambda: [0] * num_frames)  # Initialize phase lists with zeros
+                phase_lists = defaultdict(
+                    lambda: [0] * num_frames
+                )  # Initialize phase lists with zeros
 
                 # Iterate through each frame
                 for i in range(num_frames):
                     current_phase = phases[i]
 
                     # Mark 0 for the current phase
-                    for phase in range(NUM_PHASES):  # Assuming phases are numbered 1 to 7
+                    for phase in range(
+                        NUM_PHASES
+                    ):  # Assuming phases are numbered 1 to 7
                         if phase == current_phase:
                             phase_lists[phase][i] = 0
                         else:
                             # Count how many frames until this phase appears again
                             next_occurrence = next(
-                                (j - i for j in range(i + 1, num_frames) if phases[j] == phase), None
+                                (
+                                    j - i
+                                    for j in range(i + 1, num_frames)
+                                    if phases[j] == phase
+                                ),
+                                None,
                             )
                             if next_occurrence is not None:
                                 phase_lists[phase][i] = next_occurrence
@@ -380,7 +520,9 @@ class Cholec80Dataset(Dataset):
                                 phase_lists[phase][i] = num_frames
 
                 # Convert frame counts to timings
-                timings = np.asarray(list(phase_lists.values()))  # Convert phase lists to numpy array
+                timings = np.asarray(
+                    list(phase_lists.values())
+                )  # Convert phase lists to numpy array
                 timings = timings * self.target_fps  # Convert frame counts to seconds
                 timings = timings / 60  # Convert seconds to minutes
                 timings = timings.tolist()
@@ -406,7 +548,9 @@ class Cholec80Dataset(Dataset):
                     ax[i, 0].set_ylabel("Minutes")
                     ax[i, 0].set_xlabel("Frames")
                     ax[i, 0].legend()
-                    ax[i, 1].plot(np.clip(timings[i], 0, 5), label=f"{phase_dict_key[i]}")
+                    ax[i, 1].plot(
+                        np.clip(timings[i], 0, 5), label=f"{phase_dict_key[i]}"
+                    )
                     ax[i, 1].set_title(f"{phase_dict_key[i]}")
                     ax[i, 1].set_ylabel("Minutes")
                     ax[i, 1].set_xlabel("Frames")
@@ -421,24 +565,32 @@ class Cholec80Dataset(Dataset):
 
     def __getitem__(self, idx):
         metadata = copy.deepcopy(self.windows[idx])
-        frames = torch.stack([self.transform(Image.open(f)) for f in metadata["frames_filepath"]])
+        frames = torch.stack(
+            [self.transform(Image.open(f)) for f in metadata["frames_filepath"]]
+        )
 
         # load depths if available
         if "frames_depths" in metadata and self.rgbd_mode:
             # depths = torch.stack([torch.tensor(np.load(f)) for f in metadata["frames_depths"]])
-            depths = torch.stack([torch.tensor(np.load(f)) for f in metadata["frames_depths"]])
+            depths = torch.stack(
+                [torch.tensor(np.load(f)) for f in metadata["frames_depths"]]
+            )
             # transform depths
             depths = self.rgbd_transform(depths.unsqueeze(1)).squeeze(1)
             # resize depths to match frames
             # depths = Resize((224, 224))(depths.unsqueeze(1)).squeeze(1)
             metadata["depths"] = depths
-            frames_rgbd = torch.cat((frames, depths.unsqueeze(1)), dim=1)  # Concatenate RGB and Depth
+            frames_rgbd = torch.cat(
+                (frames, depths.unsqueeze(1)), dim=1
+            )  # Concatenate RGB and Depth
             metadata["frames_rgbd"] = frames_rgbd
 
         return frames, metadata
 
 
-def create_future_classification_targets(all_ph_trans_time, seq_len: int, F: int, sampling: int, i: int):
+def create_future_classification_targets(
+    all_ph_trans_time, seq_len: int, F: int, sampling: int, i: int
+):
     """
     Create SWAG targets for classification from dataset entry.
 
@@ -466,7 +618,9 @@ def create_future_classification_targets(all_ph_trans_time, seq_len: int, F: int
 
             if future_index < TOTAL_FRAMES:
                 # Check if the class is maintained (time-to-next-phase is 0)
-                swag_targets[t, f - 1, :] = (all_ph_trans_time[:, future_index] == 0).int()
+                swag_targets[t, f - 1, :] = (
+                    all_ph_trans_time[:, future_index] == 0
+                ).int()
 
     return swag_targets
 
@@ -508,7 +662,9 @@ def __test__():
                 ax[i, 1].set_xlabel("Frames")
                 # ax[i, 1].legend()
             plt.tight_layout()
-            plt.savefig(f"data/cholec80/phase_transition_time_{video_name}_{str(dtype)}.png")
+            plt.savefig(
+                f"data/cholec80/phase_transition_time_{video_name}_{str(dtype)}.png"
+            )
         plt.close()
 
     for i, batch in enumerate(dataloader):
@@ -524,7 +680,9 @@ def __test__():
         for n in [bfloat16, float16, float32]:
             diff = torch.abs(time_to_next_phase - n)  # diff in minutes
             diff_seconds = diff * 60
-            print(f"Type: {n.dtype}, Min (s): {diff_seconds.min()}, Max (s): {diff_seconds.max()}")
+            print(
+                f"Type: {n.dtype}, Min (s): {diff_seconds.min()}, Max (s): {diff_seconds.max()}"
+            )
             # print("Diff in minutes", diff)
             print("Diff in seconds:", diff_seconds)
 
@@ -550,9 +708,13 @@ def __compute_normalization__():
 
     for _, metadata in tqdm(dataset, desc="Computing normalization"):
         # load RGB frames as tensors [T,3,H,W]
-        frames_t = torch.stack([ToTensor()(Image.open(f)) for f in metadata["frames_filepath"]])
+        frames_t = torch.stack(
+            [ToTensor()(Image.open(f)) for f in metadata["frames_filepath"]]
+        )
         # load depth maps [T,H,W]
-        depths_t = torch.stack([torch.tensor(np.load(f)) for f in metadata["frames_depths"]])
+        depths_t = torch.stack(
+            [torch.tensor(np.load(f)) for f in metadata["frames_depths"]]
+        )
 
         # build RGBD [T,4,H,W]
         rgbd_t = torch.cat((frames_t, depths_t.unsqueeze(1)), dim=1)
