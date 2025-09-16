@@ -14,6 +14,13 @@
 #SBATCH --partition=boost_usr_prod      # https://wiki.u-gov.it/confluence/display/SCAIUS/UG3.2%3A+LEONARDO+UserGuide#UG3.2:LEONARDOUserGuide-Productionenvironment
 #SBATCH --qos=boost_qos_lprod
 
+# load bashrc
+source $HOME/.bashrc
+
+module purge
+# module load anaconda3/2023.03
 module load profile/deeplrn
-source activate 
+# conda activate
+source ./venv/bin/activate
+
 srun python datasets/cholec80.py
