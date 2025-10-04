@@ -3,7 +3,7 @@ import os
 import time
 import random
 
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import re
 from pathlib import Path
@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import copy
 from PIL import Image
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import Sampler
@@ -31,6 +32,207 @@ from torchvision.transforms import (
 
 VIDEO_RE = re.compile(r"video\d{2}\.mp4$", re.IGNORECASE)
 NUM_CLASSES = 6  # phases 0..5
+
+TRIPLET_VERBS = ["reach", "grasp", "release", "null"]  # 0, 1, 2, 3  (null for initial/ending states)
+TRIPLET_SUBJECTS = ["left_arm", "right_arm", "null"]  # 0, 1, 2  (null for initial/ending states)
+TRIPLET_OBJECTS = [
+    # Pegs RGBYGr : 0, 1, 2, 3, 4
+    "red_peg",
+    "green_peg",
+    "blue_peg",
+    "yellow_peg",
+    "grey_peg",
+    # Rings RGBY : 5, 6, 7, 8
+    "red_ring",
+    "green_ring",
+    "blue_ring",
+    "yellow_ring",
+    # Center, Outside : 9, 10
+    "center",
+    "outside",
+    # Arms : 11, 12
+    "left_arm",
+    "right_arm",
+    "null",  # for initial and ending states
+]
+
+
+def _parse_triplet(
+    annotation: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse annotation like 'reach(right_arm, green_ring)' into verb, subject, destination"""
+    pattern = r"(\w+)\(([^,]+),\s*([^)]+)\)"
+    match = re.match(pattern, annotation)
+    if match:
+        verb = match.group(1)
+        subject = match.group(2)
+        destination = match.group(3)
+        return verb, subject, destination
+    return None, None, None
+
+
+def _time_to_seconds(time_str: str) -> int:
+    """
+    Convert time string to total seconds.
+    Supports formats: MM:SS, MM.SS, HH:MM:SS
+    """
+    time_str = time_str.strip()
+
+    # Handle different separators (: or .)
+    if ":" in time_str:
+        parts = time_str.split(":")
+    elif "." in time_str:
+        parts = time_str.split(".")
+    else:
+        raise ValueError(f"Invalid time format: {time_str}")
+
+    if len(parts) == 2:
+        # MM:SS or MM.SS format
+        minutes = int(parts[0])
+        seconds = int(parts[1])
+        return minutes * 60 + seconds
+    elif len(parts) == 3:
+        # HH:MM:SS format
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2])
+        return hours * 3600 + minutes * 60 + seconds
+    else:
+        raise ValueError(f"Invalid time format: {time_str}")
+
+
+def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
+    """
+    Create a dense triplet lookup table for all seconds from CSV or Excel file.
+
+    Supports two formats:
+    1. CSV with separate columns: 'time', 'annotation'
+    2. Excel with combined column: 'time,annotation'
+
+    Returns a dictionary mapping seconds to triplet information.
+    """
+    if not file_path.exists():
+        return {}
+
+    try:
+        # Determine file type and read accordingly
+        if file_path.suffix.lower() == ".csv":
+            df = pd.read_csv(file_path)
+        elif file_path.suffix.lower() in [".xlsx", ".xls"]:
+            df = pd.read_excel(file_path)
+        else:
+            print(f"Warning: Unsupported file format {file_path.suffix}")
+            return {}
+
+        # Parse data based on column structure
+        parsed_data = []
+
+        if "time,annotation" in df.columns:
+            # Excel format: single combined column
+            for row in df["time,annotation"]:
+                if pd.isna(row):  # Skip NaN values
+                    continue
+                parts = str(row).split(",", 1)
+                if len(parts) == 2:
+                    time_str = parts[0].strip()
+                    annotation = parts[1].strip().strip('"')
+                    verb, subject, destination = _parse_triplet(annotation)
+                    seconds = _time_to_seconds(time_str)
+
+                    parsed_data.append(
+                        {
+                            "seconds": seconds,
+                            "annotation": annotation,
+                            "verb": verb,
+                            "subject": subject,
+                            "destination": destination,
+                        }
+                    )
+
+        elif "time" in df.columns and "annotation" in df.columns:
+            # CSV format: separate columns
+            for _, row in df.iterrows():
+                if pd.isna(row["time"]) or pd.isna(
+                    row["annotation"]
+                ):  # Skip NaN values
+                    continue
+
+                # Handle case where time column might contain the combined format
+                time_val = str(row["time"]).strip()
+                annotation_val = str(row["annotation"]).strip()
+
+                # Check if time column actually contains combined format
+                if "," in time_val and annotation_val == "nan":
+                    # This is actually combined format in the time column
+                    parts = time_val.split(",", 1)
+                    if len(parts) == 2:
+                        time_str = parts[0].strip()
+                        annotation = parts[1].strip().strip('"')
+                else:
+                    # Proper separate columns
+                    time_str = time_val
+                    annotation = annotation_val.strip('"')
+
+                verb, subject, destination = _parse_triplet(annotation)
+                seconds = _time_to_seconds(time_str)
+
+                parsed_data.append(
+                    {
+                        "seconds": seconds,
+                        "annotation": annotation,
+                        "verb": verb,
+                        "subject": subject,
+                        "destination": destination,
+                    }
+                )
+
+        else:
+            print(
+                f"Warning: Unrecognized column structure in {file_path}: {df.columns.tolist()}"
+            )
+            return {}
+
+        df_parsed = pd.DataFrame(parsed_data)
+
+        if df_parsed.empty:
+            return {}
+
+        # Create dense lookup table - fill gaps between timestamps
+        min_sec = df_parsed["seconds"].min()
+        max_sec = df_parsed["seconds"].max()
+
+        dense_lookup = {}
+        current_triplet = None
+        current_annotation = None
+        current_verb = None
+        current_subject = None
+        current_destination = None
+
+        for sec in range(min_sec, max_sec + 1):
+            # Check if we have a new triplet for this second
+            matching_rows = df_parsed[df_parsed["seconds"] == sec]
+            if not matching_rows.empty:
+                # Use the new triplet
+                row = matching_rows.iloc[0]
+                current_annotation = row["annotation"]
+                current_verb = row["verb"]
+                current_subject = row["subject"]
+                current_destination = row["destination"]
+                current_triplet = (current_verb, current_subject, current_destination)
+
+            # Store current triplet for this second
+            dense_lookup[sec] = {
+                "annotation": current_annotation,
+                "triplet": current_triplet,
+                "verb": current_verb,
+                "subject": current_subject,
+                "destination": current_destination,
+            }
+
+        return dense_lookup
+    except Exception as e:
+        print(f"Warning: Failed to parse file {file_path}: {e}")
+        return {}
 
 
 def _natural_key(s: str):
@@ -132,7 +334,7 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
                     completion[start + i] = float(i) / float(length - 1)
             else:
                 total = float(times[start, p + 1])
-                valid_total = (total > 0)
+                valid_total = total > 0
                 for i in range(1, length):
                     remaining = float(times[start + i, p + 1])
                     if (not valid_total) or (remaining < 0):
@@ -260,7 +462,9 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
         axs2[0].set_title(f"{videoname} — Completion (GT)")
 
         if compl_pred is not None:
-            axs2[1].plot(x, compl_pred, linestyle="-", linewidth=2, label="Pred Completion")
+            axs2[1].plot(
+                x, compl_pred, linestyle="-", linewidth=2, label="Pred Completion"
+            )
             axs2[1].set_ylabel("Completion")
             axs2[1].grid(True)
             axs2[1].set_ylim(0.0, 1.0)
@@ -269,10 +473,59 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
         axs2[-1].set_xlabel("Frame index")
 
         plt.tight_layout()
-        img_fname2 = images_save_path / f"{videoname}_completion_plot_{unit_tag}_fps={fps}.png"
+        img_fname2 = (
+            images_save_path / f"{videoname}_completion_plot_{unit_tag}_fps={fps}.png"
+        )
         plt.savefig(img_fname2, dpi=150)
         plt.close(fig2)
         print(f"[OK] Saved plot -> {img_fname2}")
+
+
+def triplet_to_classification(
+    verb: str, subject: str, destination: str
+) -> Tuple[int, int, int]:
+    ## Convert triplet strings to classification indices.
+
+    if verb == subject == destination == "":
+        return TRIPLET_VERBS.index("null"), TRIPLET_SUBJECTS.index("null"), TRIPLET_OBJECTS.index("null")
+
+    verb_valid = verb in TRIPLET_VERBS
+    subject_valid = subject in TRIPLET_SUBJECTS
+    destination_valid = destination in TRIPLET_OBJECTS
+    if not verb_valid or not subject_valid or not destination_valid:
+        if not verb_valid:
+            print(f"[WARN] Unknown verb: {verb}")
+        if not subject_valid:
+            print(f"[WARN] Unknown subject: {subject}")
+        if not destination_valid:
+            print(f"[WARN] Unknown destination: {destination}")
+        raise RuntimeError(f"Unknown triplet: {verb}/{subject}/{destination}")
+
+    verb_class_idx = TRIPLET_VERBS.index(verb)  # 0, 1, 2
+    subject_class_idx = TRIPLET_SUBJECTS.index(subject)  # 0, 1
+    destination_class_idx = TRIPLET_OBJECTS.index(destination)  # 0..9
+    return verb_class_idx, subject_class_idx, destination_class_idx
+
+
+def triplet_classification_to_label(
+    triplet_classification: Tuple[int, int, int],
+) -> str:
+    verb_idx, subject_idx, destination_idx = triplet_classification
+    if (
+        verb_idx < 0
+        or verb_idx >= len(TRIPLET_VERBS)
+        or subject_idx < 0
+        or subject_idx >= len(TRIPLET_SUBJECTS)
+        or destination_idx < 0
+        or destination_idx >= len(TRIPLET_OBJECTS)
+    ):
+        raise RuntimeError(
+            f"Invalid triplet classification indices: {triplet_classification}"
+        )
+    verb = TRIPLET_VERBS[verb_idx]
+    subject = TRIPLET_SUBJECTS[subject_idx]
+    destination = TRIPLET_OBJECTS[destination_idx]
+    return f"{verb}({subject}, {destination})"
 
 
 class PegAndRing(Dataset):
@@ -280,6 +533,11 @@ class PegAndRing(Dataset):
     Single-class windowed dataloader for Peg & Ring N-FPS frames + anticipation labels.
 
     All anticipation values are returned in MINUTES by default (or SECONDS if time_unit="seconds").
+
+    Args:
+        force_triplets (bool): If False (default), uses hard-coded validation split.
+                              If True, only includes videos with CSV/Excel triplet files and
+                              uses deterministic 80%-20% train/val split based on sorted video names.
 
     __getitem__ returns:
       frames: FloatTensor [T, 3, H, W]
@@ -303,6 +561,15 @@ class PegAndRing(Dataset):
         "frames_rgbd": FloatTensor [T, 4, H, W]
         # added:
         "phase_completition": torch.FloatTensor scalar in [0, 1]
+        # action triplets (if available, empty strings if not available):
+        "triplet_annotation": str                            # last frame triplet string
+        "triplet_annotation_dense": [T] list[str]            # per-frame triplet strings
+        "triplet_verb": str                                  # last frame verb
+        "triplet_subject": str                               # last frame subject
+        "triplet_destination": str                           # last frame destination
+        "triplet_verb_dense": [T] list[str]                  # per-frame verbs
+        "triplet_subject_dense": [T] list[str]               # per-frame subjects
+        "triplet_destination_dense": [T] list[str]           # per-frame destinations
     """
 
     def __init__(
@@ -325,7 +592,8 @@ class PegAndRing(Dataset):
         future_F: int = 1,
         add_depth_to_frames: bool = True,
         prev_T: int = 0,
-        augment: bool = False
+        augment: bool = False,
+        force_triplets: bool = False,
     ):
         super().__init__()
         assert fps in [1, 5], "Not implemented with FPS not in [1, 5]"
@@ -343,6 +611,7 @@ class PegAndRing(Dataset):
         self.std = torch.tensor(std, dtype=dtype).view(3, 1, 1)
         self.dtype = dtype
         self.to_rgb = to_rgb
+        self.force_triplets = force_triplets
 
         self.rgbd_mode = rgbd_mode
         self.depth_dir_name = depth_dir_name
@@ -362,12 +631,13 @@ class PegAndRing(Dataset):
         # For eval/val/test we keep deterministic resize+center-crop.
         self.resize_size = (250, 250)
         self.crop_size = (224, 224)
-        self.train_color_jitter = dict(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)
+        self.train_color_jitter = dict(
+            brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05
+        )
         self.train_rotation = 5  # degrees
         self.hflip_p = 0.5
         self.use_train_aug = (self.mode == "train") and (self.augment == True)
 
-        val_videos = {"video01", "video13", "video15", "video22", "video27"}
         all_entries = _list_videos_with_fps(self.root, self.fps)
         if not all_entries:
             raise RuntimeError(
@@ -378,10 +648,47 @@ class PegAndRing(Dataset):
             print("[W] Test mode not implemented, using 'val'")
             self.mode = "val"
 
-        if self.mode == "train":
-            entries = [e for e in all_entries if e[0] not in val_videos]
+        if self.force_triplets:
+            # Filter entries to only include videos with triplet data
+            entries_with_triplets = []
+            for videoname, video_path, frames_dir, frame_paths in all_entries:
+                csv_path = self.root / f"{videoname}.csv"
+                xlsx_path = self.root / f"{videoname}.xlsx"
+                if csv_path.exists() or xlsx_path.exists():
+                    entries_with_triplets.append(
+                        (videoname, video_path, frames_dir, frame_paths)
+                    )
+
+            if not entries_with_triplets:
+                raise RuntimeError(
+                    "No videos with triplet data found when force_triplets=True"
+                )
+
+            # Deterministic 80%-20% split based on sorted video names
+            entries_with_triplets.sort(
+                key=lambda x: x[0]
+            )  # Sort by video name for determinism
+            n_videos = len(entries_with_triplets)
+            n_train = int(0.8 * n_videos)
+
+            train_entries = entries_with_triplets[:n_train]
+            val_entries = entries_with_triplets[n_train:]
+
+            if self.mode == "train":
+                entries = train_entries
+            else:  # val or test
+                entries = val_entries
+
+            print(
+                f"[INFO] Using triplet-based split: {len(train_entries)} train, {len(val_entries)} val videos"
+            )
         else:
-            entries = [e for e in all_entries if e[0] in val_videos]
+            # Use original hard-coded validation split
+            val_videos = {"video01", "video13", "video15", "video22", "video27"}
+            if self.mode == "train":
+                entries = [e for e in all_entries if e[0] not in val_videos]
+            else:
+                entries = [e for e in all_entries if e[0] in val_videos]
 
         if not entries:
             raise RuntimeError(f"No entries for split '{self.mode}'")
@@ -391,6 +698,9 @@ class PegAndRing(Dataset):
 
         self.ant_cache: Dict[str, np.ndarray] = {}
         self.compl_cache: Dict[str, np.ndarray] = {}  # per-frame completion in [0,1]
+        self.triplet_cache: Dict[str, Dict[int, Dict[str, Any]]] = (
+            {}
+        )  # per-video triplet lookup
         self.meta: Dict[str, Tuple[int, float]] = {}
         unit_tag = f"{self.time_unit}"
 
@@ -428,6 +738,19 @@ class PegAndRing(Dataset):
             # ---------- NEW: pre-compute per-frame completion in [0,1] ----------
             compl = self._precompute_phase_completion_per_frame(ant_unit)
             self.compl_cache[videoname] = compl.astype(np.float32)  # shape [n1]
+
+            # ---------- NEW: load action triplet data if available ----------
+            # Try both CSV and Excel formats
+            csv_path = self.root / f"{videoname}.csv"
+            xlsx_path = self.root / f"{videoname}.xlsx"
+
+            triplet_lookup = {}
+            if csv_path.exists():
+                triplet_lookup = _create_dense_triplet_lookup(csv_path)
+            elif xlsx_path.exists():
+                triplet_lookup = _create_dense_triplet_lookup(xlsx_path)
+
+            self.triplet_cache[videoname] = triplet_lookup
 
             for local_idx, fp in enumerate(frame_paths):
                 flat_index.append((videoname, frames_dir, fp, local_idx))
@@ -469,8 +792,8 @@ class PegAndRing(Dataset):
                     if len(depth_paths_exist) == len(frame_paths):
                         window["frames_depths"] = depth_paths_exist
 
-                ant_at_fps = self.ant_cache[videoname]        # [N_frames, C]
-                gts_window = ant_at_fps[frame_idxs]           # [T, C]
+                ant_at_fps = self.ant_cache[videoname]  # [N_frames, C]
+                gts_window = ant_at_fps[frame_idxs]  # [T, C]
 
                 # determine dense phases from GT anticipation
                 phase_dense = []
@@ -531,6 +854,46 @@ class PegAndRing(Dataset):
                 completion_arr = self.compl_cache[videoname]  # [N_frames]
                 completion_last = float(completion_arr[frame_idxs[-1]])
 
+                # ---------- NEW: Extract triplet information for this window ----------
+                triplet_lookup = self.triplet_cache.get(videoname, {})
+
+                # Map frame indices to seconds (frame_idx / fps gives the second)
+                def frame_idx_to_second(frame_idx):
+                    return int(frame_idx // self.fps) if self.fps > 0 else frame_idx
+
+                # Get triplet data for each frame in the window
+                triplet_annotations_dense = []
+                triplet_verbs_dense = []
+                triplet_subjects_dense = []
+                triplet_destinations_dense = []
+
+                for frame_idx in frame_idxs:
+                    second = frame_idx_to_second(frame_idx)
+                    triplet_data = triplet_lookup.get(second, {})
+
+                    triplet_annotations_dense.append(triplet_data.get("annotation", ""))
+                    triplet_verbs_dense.append(triplet_data.get("verb", ""))
+                    triplet_subjects_dense.append(triplet_data.get("subject", ""))
+                    triplet_destinations_dense.append(
+                        triplet_data.get("destination", "")
+                    )
+
+                # Get triplet data for the last frame (used as window-level triplet)
+                last_frame_second = frame_idx_to_second(frame_idxs[-1])
+                last_triplet_data = triplet_lookup.get(last_frame_second, {})
+
+                triplet_annotation_last = last_triplet_data.get("annotation", "")
+                triplet_verb_last = last_triplet_data.get("verb", "")
+                triplet_subject_last = last_triplet_data.get("subject", "")
+                triplet_destination_last = last_triplet_data.get("destination", "")
+
+                triplet_classification = triplet_to_classification(
+                    triplet_verb_last, triplet_subject_last, triplet_destination_last
+                )
+                triplet_classification_tensor = torch.as_tensor(
+                    triplet_classification, dtype=torch.long
+                )
+
                 window.update(
                     {
                         "video_name": videoname,
@@ -549,6 +912,16 @@ class PegAndRing(Dataset):
                         "prev_phases": prev_phases,
                         "prev_anticipation": prev_anticipation,
                         "phase_completition": completion_last,  # scalar float in [0,1]
+                        # Action triplet information
+                        "triplet_annotation": triplet_annotation_last,
+                        "triplet_annotation_dense": triplet_annotations_dense,
+                        "triplet_verb": triplet_verb_last,
+                        "triplet_subject": triplet_subject_last,
+                        "triplet_destination": triplet_destination_last,
+                        "triplet_verb_dense": triplet_verbs_dense,
+                        "triplet_subject_dense": triplet_subjects_dense,
+                        "triplet_destination_dense": triplet_destinations_dense,
+                        "triplet_classification": triplet_classification_tensor,
                     }
                 )
                 self.windows.append(window)
@@ -571,7 +944,9 @@ class PegAndRing(Dataset):
         print(f"Loading done in {1/(time.time() - start):.2f} seconds")
 
     # --------- NEW: precompute completion per frame (using ant_unit only) ----------
-    def _precompute_phase_completion_per_frame(self, ant_unit: np.ndarray) -> np.ndarray:
+    def _precompute_phase_completion_per_frame(
+        self, ant_unit: np.ndarray
+    ) -> np.ndarray:
         """
         Given ant_unit [N_frames, NUM_CLASSES], compute per-frame completion in [0,1]
         towards the next phase. Enforces completion[start_of_segment] == 0 exactly.
@@ -608,7 +983,7 @@ class PegAndRing(Dataset):
                     completion[start + i] = float(i) / float(length - 1)
             else:
                 total = float(ant_unit[start, p + 1])
-                valid_total = (total > 0)
+                valid_total = total > 0
                 for i in range(1, length):
                     remaining = float(ant_unit[start + i, p + 1])
                     if (not valid_total) or (remaining < 0):
@@ -682,7 +1057,9 @@ class PegAndRing(Dataset):
         return len(self.windows)
 
     # --------- NEW: consistent window-level augmentation ----------
-    def _apply_consistent_transform(self, pil_images: List[Image.Image]) -> torch.Tensor:
+    def _apply_consistent_transform(
+        self, pil_images: List[Image.Image]
+    ) -> torch.Tensor:
         """
         Apply the same randomly-sampled augmentation parameters to all frames in a window
         (temporal consistency). Returns a float tensor [T, 3, H, W] normalized.
@@ -711,7 +1088,12 @@ class PegAndRing(Dataset):
             for img in imgs:
                 if do_hflip:
                     img = TF.hflip(img)
-                img = TF.rotate(img, angle, interpolation=TF.InterpolationMode.BILINEAR, expand=False)
+                img = TF.rotate(
+                    img,
+                    angle,
+                    interpolation=TF.InterpolationMode.BILINEAR,
+                    expand=False,
+                )
                 # color jitter sequence: brightness -> contrast -> saturation -> hue
                 img = TF.adjust_brightness(img, b)
                 img = TF.adjust_contrast(img, c)
@@ -719,7 +1101,11 @@ class PegAndRing(Dataset):
                 img = TF.adjust_hue(img, h)
                 img = TF.crop(img, top=i, left=j, height=h_crop, width=w_crop)
                 tens = TF.to_tensor(img)
-                tens = TF.normalize(tens, mean=self.mean.flatten().tolist(), std=self.std.flatten().tolist())
+                tens = TF.normalize(
+                    tens,
+                    mean=self.mean.flatten().tolist(),
+                    std=self.std.flatten().tolist(),
+                )
                 out.append(tens)
             return torch.stack(out, dim=0)
         else:
@@ -728,17 +1114,21 @@ class PegAndRing(Dataset):
             for img in imgs:
                 img = TF.center_crop(img, self.crop_size)
                 tens = TF.to_tensor(img)
-                tens = TF.normalize(tens, mean=self.mean.flatten().tolist(), std=self.std.flatten().tolist())
+                tens = TF.normalize(
+                    tens,
+                    mean=self.mean.flatten().tolist(),
+                    std=self.std.flatten().tolist(),
+                )
                 out.append(tens)
             return torch.stack(out, dim=0)
 
     def __getitem__(self, idx: int):
         meta = copy.deepcopy(self.windows[idx])
 
-        pil_frames = [
-            Image.open(f).convert("RGB") for f in meta["frames_filepath"]
-        ]
-        frames = self._apply_consistent_transform(pil_frames).contiguous()  # [T, 3, H, W]
+        pil_frames = [Image.open(f).convert("RGB") for f in meta["frames_filepath"]]
+        frames = self._apply_consistent_transform(
+            pil_frames
+        ).contiguous()  # [T, 3, H, W]
 
         meta["frames_indexes"] = torch.asarray(meta["frames_indexes"], dtype=torch.long)
         meta["phase_label"] = torch.asarray(meta["phase_label"], dtype=torch.float32)
@@ -900,10 +1290,10 @@ class VideoBatchSampler(BatchSampler):
 
 if __name__ == "__main__":
 
-    _show_plot(1, 1)
-    _show_plot(1, 5)
-    _show_plot(2, 1)
-    _show_plot(2, 5)
+    # _show_plot(1, 1)
+    # _show_plot(1, 5)
+    # _show_plot(2, 1)
+    # _show_plot(2, 5)
 
     ds_train_5fps = PegAndRing(
         root_dir="data/peg_and_ring_workflow",
@@ -1015,6 +1405,43 @@ if __name__ == "__main__":
         print(
             f"Idx: {i}, batch_len={frames.shape[0]} frames_idxs={frames_idxs} video_name={meta['video_name']}, completion={meta['phase_completition'][:4]}"
         )
+        if i > 10:
+            break
+    
+    gen_train = torch.Generator()
+    gen_train.manual_seed(42)
+    train_batch_sampler_fixed = VideoBatchSampler(
+        ds_train,
+        batch_size=32,
+        drop_last=False,
+        shuffle_videos=True,
+        generator=gen_train,
+        batch_videos=False,  # fixed-size batches
+    )
+    ds_train = PegAndRing(
+        root_dir="data/peg_and_ring_workflow",
+        mode="train",
+        seq_len=16,
+        stride=1,
+        fps=1,
+        time_unit="minutes",
+        prev_T=5,
+        force_triplets=True,
+    )
+    print("train windows (triplet split):", len(ds_train))
+    dataloader_B2 = DataLoader(
+        ds_train,
+        batch_sampler=train_batch_sampler_fixed,
+        num_workers=8,
+        pin_memory=False,
+    )
+    for i, (frames, meta) in enumerate(dataloader_B2):
+        frames_idxs = meta["frames_indexes"]
+        print(
+            f"Idx: {i}, batch_len={frames.shape[0]} frames_idxs={frames_idxs} video_name={meta['video_name']}, triplet_verb={meta['triplet_verb']}, triplet_subject={meta['triplet_subject']}, triplet_destination={meta['triplet_destination']}, triplet_classification={meta['triplet_classification']}"
+        )
+        if i > 10:
+            break
 
     # ----- Validation/Test sets (for counts) -----
     ds_val = PegAndRing(

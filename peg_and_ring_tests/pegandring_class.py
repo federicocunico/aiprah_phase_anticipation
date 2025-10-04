@@ -2,7 +2,7 @@
 # train_phase_classifier_with_viz.py
 
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import time
 import random
