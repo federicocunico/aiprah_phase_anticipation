@@ -17,8 +17,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
+import wandb
+from typing import NamedTuple
 
-from datasets.peg_and_ring_workflow import PegAndRing, VideoBatchSampler
+from datasets.peg_and_ring_workflow import PegAndRing, VideoBatchSampler, TRIPLET_VERBS, TRIPLET_SUBJECTS, TRIPLET_OBJECTS
 import torch.nn.functional as F
 
 # ---- backbone (torchvision) ----
@@ -370,6 +372,44 @@ class TemporalConformerEncoder(nn.Module):
         return x
 
 
+class MultiTaskLossWeighter(nn.Module):
+    """
+    Uncertainty-based multi-task loss weighting from:
+    'Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics'
+    """
+    def __init__(self, num_tasks: int):
+        super().__init__()
+        # Log-variance parameters for each task
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+        
+    def forward(self, losses: torch.Tensor) -> torch.Tensor:
+        """
+        losses: [num_tasks] tensor of individual task losses
+        Returns weighted total loss
+        """
+        # Uncertainty weighting: loss / (2 * sigma^2) + log(sigma)
+        # where sigma^2 = exp(log_var)
+        weights = torch.exp(-self.log_vars)
+        weighted_losses = weights * losses + 0.5 * self.log_vars
+        return weighted_losses.sum()
+    
+    def get_weights(self) -> torch.Tensor:
+        """Return current task weights for logging"""
+        return torch.exp(-self.log_vars)
+
+
+class TaskOutputs(NamedTuple):
+    """
+    Structured outputs for multi-task model
+    """
+    anticipation: torch.Tensor
+    phase_logits: torch.Tensor 
+    completion: torch.Tensor
+    triplet_verb_logits: torch.Tensor
+    triplet_subject_logits: torch.Tensor
+    triplet_destination_logits: torch.Tensor
+
+
 # -----------------------------
 # Slow-Fast Anticipation Model (differentiable constraints)
 # -----------------------------
@@ -459,12 +499,40 @@ class SlowFastTemporalAnticipation(nn.Module):
         # ---- Gated fusion on the fast timeline ----
         self.fusion_gate_fast = GatedFusion(hidden_channels)
 
-        # ---- Post-merge causal Conformer encoder ----
-        self.temporal_encoder = TemporalConformerEncoder(
+        # ---- Separate Task-Specific Encoders ----
+        # Phase anticipation encoder (main task)
+        self.phase_temporal_encoder = TemporalConformerEncoder(
             d_model=hidden_channels,
             num_layers=num_temporal_layers,
             num_heads=attn_heads,
             dropout=dropout,
+        )
+        
+        # Triplet classification encoder (auxiliary task) - more capacity for complex task
+        self.triplet_temporal_encoder = TemporalConformerEncoder(
+            d_model=hidden_channels,
+            num_layers=num_temporal_layers + 1,  # More layers for complex triplet task
+            num_heads=attn_heads,
+            dropout=dropout * 0.5,  # Less dropout for harder task
+        )
+        
+        # Cross-task attention for knowledge transfer
+        self.cross_task_attention = nn.MultiheadAttention(
+            embed_dim=hidden_channels,
+            num_heads=attn_heads // 2,
+            dropout=dropout,
+            batch_first=True,
+        )
+        
+        # Triplet-specific attention pooling (look at entire sequence)
+        self.triplet_attention_pool = nn.MultiheadAttention(
+            embed_dim=hidden_channels,
+            num_heads=attn_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.triplet_query = nn.Parameter(
+            torch.randn(1, 1, hidden_channels) * 0.02
         )
 
         # ---- Heads ----
@@ -503,6 +571,60 @@ class SlowFastTemporalAnticipation(nn.Module):
             nn.Sigmoid(),
         )
 
+        # ---- Enhanced Triplet Classification Heads ----
+        # Hierarchical triplet processing with shared and specific components
+        
+        # Shared triplet feature processor
+        self.triplet_shared_processor = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+        )
+        
+        # Verb head (4 classes - relatively simple)
+        self.triplet_verb_head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.LayerNorm(hidden_channels // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_channels // 2, NUM_VERBS),
+        )
+        
+        # Subject head (3 classes - simple)
+        self.triplet_subject_head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.LayerNorm(hidden_channels // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_channels // 2, NUM_SUBJECTS),
+        )
+        
+        # Destination head (14 classes - complex, needs much more capacity)
+        self.triplet_destination_head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels * 2),  # Double capacity
+            nn.LayerNorm(hidden_channels * 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.3),  # Less dropout
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.3),
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.LayerNorm(hidden_channels // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.3),
+            nn.Linear(hidden_channels // 2, NUM_OBJECTS),
+        )
+        
+        # Triplet component interaction modeling
+        self.triplet_interaction_attention = nn.MultiheadAttention(
+            embed_dim=hidden_channels,
+            num_heads=6,
+            dropout=dropout * 0.5,
+            batch_first=True,
+        )
+
         self._init_weights()
 
     # ----- utils -----
@@ -534,6 +656,9 @@ class SlowFastTemporalAnticipation(nn.Module):
             self.phase_head,
             self.anticipation_head,
             self.completion_head,
+            self.triplet_verb_head,
+            self.triplet_subject_head,
+            self.triplet_destination_head,
         ]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
@@ -555,10 +680,11 @@ class SlowFastTemporalAnticipation(nn.Module):
         self,
         frames: torch.Tensor,
         meta: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> TaskOutputs:
         B, T, C_in, H, W = frames.shape
         assert T == self.T, f"Expected sequence length {self.T}, got {T}"
 
+        # ---- Shared Feature Extraction ----
         # Pathway sampling
         frames_fast = frames
         idx_slow = torch.arange(0, T, 2, device=frames.device)
@@ -589,21 +715,35 @@ class SlowFastTemporalAnticipation(nn.Module):
         tf = self.temporal_cnn_fast(feats_fast)
         ts = self.temporal_cnn_slow(feats_slow)
 
-        # Align + fuse
+        # Align + fuse shared features
         ts_up = F.interpolate(ts, size=T, mode="linear", align_corners=False)
-        fused_fast = self.fusion_gate_fast(tf, ts_up)
+        shared_features = self.fusion_gate_fast(tf, ts_up)  # [B, C, T]
+        shared_seq = shared_features.transpose(1, 2)  # [B, T, C]
 
-        # Conformer temporal encoder
-        encoded = self.temporal_encoder(fused_fast.transpose(1, 2))
+        # ---- Task-Specific Processing ----
+        # Phase anticipation branch
+        phase_encoded = self.phase_temporal_encoder(shared_seq)
+        phase_current = phase_encoded[:, -1, :]  # Current timestep for classification
+        
+        # Triplet classification branch (separate encoder)
+        triplet_encoded = self.triplet_temporal_encoder(shared_seq)
+        
+        # Cross-task knowledge transfer (optional)
+        # Let triplet branch learn from phase branch
+        triplet_enhanced, _ = self.cross_task_attention(
+            query=triplet_encoded,
+            key=phase_encoded,
+            value=phase_encoded
+        )
+        triplet_encoded = triplet_encoded + 0.1 * triplet_enhanced  # Residual connection
+        
+        # ---- Phase Task Outputs ----
+        phase_logits = self.phase_head(phase_current)
+        completion = self.completion_head(phase_current)
 
-        # Heads
-        current = encoded[:, -1, :]
-        phase_logits = self.phase_head(current)
-        completion = self.completion_head(current)
-
-        # Anticipation via attention pooling
+        # Phase anticipation via attention pooling
         query = self.anticipation_query.expand(B, -1, -1)
-        pooled, _ = self.temporal_attention_pool(query=query, key=encoded, value=encoded)
+        pooled, _ = self.temporal_attention_pool(query=query, key=phase_encoded, value=phase_encoded)
         pooled = pooled.squeeze(1)
         raw = self.anticipation_head(pooled)
 
@@ -616,7 +756,38 @@ class SlowFastTemporalAnticipation(nn.Module):
         y = y - m
         anticipation = F.softplus(y, beta=self.floor_beta)
 
-        return anticipation, phase_logits, completion, {}
+        # ---- Triplet Task Outputs ----
+        # Global context + current state for triplet reasoning
+        triplet_query = self.triplet_query.expand(B, -1, -1)
+        triplet_global, _ = self.triplet_attention_pool(
+            query=triplet_query, key=triplet_encoded, value=triplet_encoded
+        )
+        triplet_global = triplet_global.squeeze(1)  # [B, C]
+        triplet_current = triplet_encoded[:, -1, :]   # [B, C]
+        
+        # Multi-scale triplet reasoning
+        triplet_contexts = torch.stack([triplet_global, triplet_current], dim=1)  # [B, 2, C]
+        triplet_refined, _ = self.triplet_interaction_attention(
+            query=triplet_contexts, key=triplet_contexts, value=triplet_contexts
+        )
+        
+        # Combine global and local triplet understanding
+        triplet_features = triplet_refined.mean(dim=1)  # [B, C]
+        triplet_features = self.triplet_shared_processor(triplet_features)
+        
+        # Individual triplet component predictions
+        triplet_verb_logits = self.triplet_verb_head(triplet_features)
+        triplet_subject_logits = self.triplet_subject_head(triplet_features) 
+        triplet_destination_logits = self.triplet_destination_head(triplet_features)
+
+        return TaskOutputs(
+            anticipation=anticipation,
+            phase_logits=phase_logits,
+            completion=completion,
+            triplet_verb_logits=triplet_verb_logits,
+            triplet_subject_logits=triplet_subject_logits,
+            triplet_destination_logits=triplet_destination_logits,
+        )
 
 
 # ---------------------------
@@ -627,12 +798,19 @@ ROOT_DIR = "data/peg_and_ring_workflow"
 TIME_UNIT = "minutes"
 NUM_CLASSES = 6
 
+# Triplet classification dimensions - dynamically imported from dataset
+NUM_VERBS = len(TRIPLET_VERBS)      # dynamically: reach, grasp, release, null
+NUM_SUBJECTS = len(TRIPLET_SUBJECTS)   # dynamically: left_arm, right_arm, null  
+NUM_OBJECTS = len(TRIPLET_OBJECTS)   # dynamically: 5 pegs + 4 rings + center + outside + 2 arms + null
+
 SEQ_LEN = 16
 STRIDE = 1
 
-BATCH_SIZE = 12
+BATCH_SIZE = 12  # Reduced physical batch size
+GRADIENT_ACCUMULATION_STEPS = 2  # Effective batch size = 12 * 2 = 24
+USE_GRADIENT_ACCUMULATION = False  # Enable/disable gradient accumulation
 NUM_WORKERS = 30
-EPOCHS = 50
+EPOCHS = 200
 
 LR = 1e-4
 WEIGHT_DECAY = 2e-4
@@ -640,12 +818,21 @@ WEIGHT_DECAY = 2e-4
 TIME_HORIZON = 2.0
 
 PRINT_EVERY = 40
-CKPT_PATH = Path("peg_and_ring_slowfast_transformer.pth")
-LAST_CKPT_PATH = Path("peg_and_ring_slowfast_transformer_last.pth")  # resume point
+CKPT_PATH = Path("peg_and_ring_slowfast_transformer_triplets.pth")
+LAST_CKPT_PATH = Path("peg_and_ring_slowfast_transformer_triplets_last.pth")  # resume point
 
 # control flags
-DO_TRAIN = False
+DO_TRAIN = True
 RESUME_IF_CRASH = True
+USE_WANDB = True  # Enable Weights & Biases logging
+WANDB_PROJECT = "peg_ring_slowfast_triplets_v2"  # wandb project name
+WANDB_RUN_NAME = None  # Auto-generated if None
+
+# Multi-task learning configuration
+USE_DYNAMIC_LOSS_WEIGHTING = True  # Use uncertainty-based loss weighting
+USE_SEPARATE_TASK_ENCODERS = True  # Use separate encoders for different tasks
+TRIPLET_ENCODER_EXTRA_LAYERS = 1   # Extra layers for triplet encoder
+CROSS_TASK_ATTENTION_WEIGHT = 0.1  # Weight for cross-task knowledge transfer
 
 EVAL_ROOT = Path("results/eval_outputs_slowfast")
 EVAL_CLS_DIR = EVAL_ROOT / "classification"
@@ -677,10 +864,19 @@ def evaluate(
 ) -> Dict[str, Any]:
     model.eval()
 
+    # Phase anticipation and classification metrics
     total_mae = 0.0
     total_ce = 0.0
     total_acc = 0.0
     total_cmae = 0.0
+    
+    # Triplet classification metrics  
+    total_triplet_verb_acc = 0.0
+    total_triplet_subject_acc = 0.0
+    total_triplet_destination_acc = 0.0
+    total_triplet_complete_acc = 0.0  # All three components correct
+    total_triplet_ce = 0.0
+    
     total_samples = 0
 
     ce_loss = nn.CrossEntropyLoss()
@@ -691,29 +887,101 @@ def evaluate(
         ttnp = torch.clamp(ttnp, min=0.0, max=time_horizon)
         labels = meta["phase_label"].to(device).long()
         completion_gt = meta["phase_completition"].to(device).float().unsqueeze(1)
+        
+        # Triplet ground truth labels
+        triplet_gt = meta["triplet_classification"].to(device).long()  # [B, 3]
+        triplet_verb_gt = triplet_gt[:, 0]     # [B]
+        triplet_subject_gt = triplet_gt[:, 1]  # [B]
+        triplet_dest_gt = triplet_gt[:, 2]     # [B]
 
-        reg, logits, completion_pred, _ = model(frames, meta)
+        outputs = model(frames, meta)
 
-        preds_cls = logits.argmax(dim=1)
+        # Phase metrics
+        preds_cls = outputs.phase_logits.argmax(dim=1)
         acc = (preds_cls == labels).float().mean()
-        mae = torch.mean(torch.abs(reg - ttnp))
-        ce = ce_loss(logits, labels)
-        cmae = torch.mean(torch.abs(completion_pred - completion_gt))
+        mae = torch.mean(torch.abs(outputs.anticipation - ttnp))
+        ce = ce_loss(outputs.phase_logits, labels)
+        cmae = torch.mean(torch.abs(outputs.completion - completion_gt))
+
+        # Triplet metrics
+        triplet_verb_logits = outputs.triplet_verb_logits
+        triplet_subject_logits = outputs.triplet_subject_logits
+        triplet_dest_logits = outputs.triplet_destination_logits
+        
+        triplet_verb_pred = triplet_verb_logits.argmax(dim=1)
+        triplet_subject_pred = triplet_subject_logits.argmax(dim=1)
+        triplet_dest_pred = triplet_dest_logits.argmax(dim=1)
+        
+        # Individual component accuracies
+        verb_acc = (triplet_verb_pred == triplet_verb_gt).float().mean()
+        subject_acc = (triplet_subject_pred == triplet_subject_gt).float().mean()
+        dest_acc = (triplet_dest_pred == triplet_dest_gt).float().mean()
+        
+        # Complete triplet accuracy (all three components correct)
+        complete_correct = (
+            (triplet_verb_pred == triplet_verb_gt) &
+            (triplet_subject_pred == triplet_subject_gt) &
+            (triplet_dest_pred == triplet_dest_gt)
+        ).float().mean()
+        
+        # Triplet cross-entropy losses
+        triplet_verb_ce = ce_loss(triplet_verb_logits, triplet_verb_gt)
+        triplet_subject_ce = ce_loss(triplet_subject_logits, triplet_subject_gt)
+        triplet_dest_ce = ce_loss(triplet_dest_logits, triplet_dest_gt)
+        triplet_total_ce = (triplet_verb_ce + triplet_subject_ce + triplet_dest_ce) / 3.0
 
         bs = frames.size(0)
         total_mae += float(mae.item()) * bs
         total_ce += float(ce.item()) * bs
         total_acc += float(acc.item()) * bs
         total_cmae += float(cmae.item()) * bs
+        
+        total_triplet_verb_acc += float(verb_acc.item()) * bs
+        total_triplet_subject_acc += float(subject_acc.item()) * bs
+        total_triplet_destination_acc += float(dest_acc.item()) * bs
+        total_triplet_complete_acc += float(complete_correct.item()) * bs
+        total_triplet_ce += float(triplet_total_ce.item()) * bs
+        
         total_samples += bs
 
     return {
+        # Phase anticipation and classification
         "mae": total_mae / max(1, total_samples),
         "ce": total_ce / max(1, total_samples),
         "acc": total_acc / max(1, total_samples),
         "compl_mae": total_cmae / max(1, total_samples),
+        
+        # Triplet classification metrics
+        "triplet_verb_acc": total_triplet_verb_acc / max(1, total_samples),
+        "triplet_subject_acc": total_triplet_subject_acc / max(1, total_samples),
+        "triplet_destination_acc": total_triplet_destination_acc / max(1, total_samples),
+        "triplet_complete_acc": total_triplet_complete_acc / max(1, total_samples),
+        "triplet_ce": total_triplet_ce / max(1, total_samples),
+        
         "samples": total_samples,
     }
+
+
+def log_to_wandb(metrics: Dict[str, Any], step: Optional[int] = None):
+    """Log metrics to wandb with optional step."""
+    if not USE_WANDB or not wandb.run:
+        print(f"[WARN] Wandb not available: USE_WANDB={USE_WANDB}, wandb.run={wandb.run}")
+        return
+    
+    log_dict = {}
+    for key, value in metrics.items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            log_dict[key] = float(value)
+    
+    if log_dict:
+        if step is not None:
+            wandb.log(log_dict, step=step)
+            # ] Logged {len(log_dict)} metrics to wandb at step {step}: {list(log_dict.keys())}")
+        else:
+            wandb.log(log_dict)
+            # print(f"[DEBUG] Logged {len(log_dict)} metrics to wandb: {list(log_dict.keys())}")
+    else:
+        print(f"[WARN] No valid metrics to log: {metrics}")
 
 
 # ---------------------------
@@ -734,7 +1002,7 @@ def visualize_phase_timelines_classification(
     model.eval()
 
     ds = PegAndRing(
-        root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit
+        root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit, force_triplets=True
     )
 
     gen = torch.Generator()
@@ -770,9 +1038,9 @@ def visualize_phase_timelines_classification(
             continue
 
         frames = frames.to(device)
-        _, logits, _, _ = model(frames, meta)
+        outputs = model(frames, meta)
 
-        pred_phase = logits.argmax(dim=1).detach().cpu().numpy()
+        pred_phase = outputs.phase_logits.argmax(dim=1).detach().cpu().numpy()
         idx_last = meta["frames_indexes"][:, -1].cpu().numpy()
         gt_phase = meta["phase_label"].cpu().numpy()
 
@@ -827,7 +1095,7 @@ def visualize_anticipation_curves(
     model.eval()
 
     ds = PegAndRing(
-        root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit
+        root_dir=root_dir, mode=split, seq_len=SEQ_LEN, stride=1, time_unit=time_unit, force_triplets=True
     )
 
     gen = torch.Generator()
@@ -863,9 +1131,9 @@ def visualize_anticipation_curves(
             continue
 
         frames = frames.to(device)
-        outputs, _, _, _ = model(frames, meta)
+        model_outputs = model(frames, meta)
 
-        pred = torch.clamp(outputs, min=0.0, max=time_horizon).detach().cpu().numpy()
+        pred = torch.clamp(model_outputs.anticipation, min=0.0, max=time_horizon).detach().cpu().numpy()
         gt = (
             torch.clamp(meta["time_to_next_phase"], min=0.0, max=time_horizon)
             .cpu()
@@ -996,23 +1264,46 @@ def train(
     val_loader: DataLoader,
     device: torch.device,
 ):
-    # Losses / Optim
+    
+    # Losses
     reg_loss = nn.SmoothL1Loss(reduction="mean")
     ce_loss = nn.CrossEntropyLoss()
     compl_loss = nn.SmoothL1Loss(beta=0.3)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
-    # Cosine Annealing LR (epoch-level)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=1e-6
+    
+    # Multi-task loss weighter
+    loss_weighter = MultiTaskLossWeighter(num_tasks=6).to(device)  # reg, cls, compl, verb, subj, dest
+    
+    # Separate optimizers for main model and loss weighting
+    model_optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    weighter_optimizer = optim.AdamW(loss_weighter.parameters(), lr=LR * 10, weight_decay=0)  # Higher LR for weighting
+    
+    # Separate schedulers
+    model_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        model_optimizer, T_max=EPOCHS, eta_min=1e-6
+    )
+    weighter_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        weighter_optimizer, T_max=EPOCHS, eta_min=1e-5
     )
 
     # Resume if requested
-    start_epoch, best_val_mae = _try_resume(model, optimizer, scheduler, device)
+    start_epoch, best_val_mae = _try_resume(model, model_optimizer, model_scheduler, device)
+
+    # Run initial validation before training starts
+    if start_epoch == 1:
+        print("Running initial validation before training...")
+        val_stats_initial = evaluate(model, val_loader, device, TIME_HORIZON)
+        print(f"Initial validation: mae={val_stats_initial['mae']:.4f} acc={val_stats_initial['acc']:.4f}")
+        log_to_wandb({
+            "val_mae_initial": val_stats_initial['mae'],
+            "val_accuracy_initial": val_stats_initial['acc'],
+            "val_triplet_complete_accuracy_initial": val_stats_initial['triplet_complete_acc'],
+        }, step=0)
 
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         epoch_mae = epoch_ce = epoch_loss = epoch_acc = epoch_cmae = 0.0
+        epoch_triplet_ce = epoch_triplet_verb_acc = epoch_triplet_subject_acc = 0.0
+        epoch_triplet_dest_acc = epoch_triplet_complete_acc = 0.0
         seen = 0
         t0 = time.time()
 
@@ -1023,63 +1314,174 @@ def train(
             ttnp = torch.clamp(
                 meta["time_to_next_phase"].to(device).float(), 0.0, TIME_HORIZON
             )
+            
+            # Triplet ground truth labels
+            triplet_gt = meta["triplet_classification"].to(device).long()  # [B, 3]
+            triplet_verb_gt = triplet_gt[:, 0]
+            triplet_subject_gt = triplet_gt[:, 1]
+            triplet_dest_gt = triplet_gt[:, 2]
 
-            reg, logits, completion_pred, _ = model(frames, meta)
+            outputs = model(frames, meta)
 
-            loss_compl = compl_loss(completion_pred, complets_gt)
-            loss_cls = ce_loss(logits, labels)
-            loss_reg = reg_loss(reg, ttnp)
-            loss_total = loss_reg + loss_cls + loss_compl
+            # Individual task losses
+            loss_reg = reg_loss(outputs.anticipation, ttnp)
+            loss_cls = ce_loss(outputs.phase_logits, labels)
+            loss_compl = compl_loss(outputs.completion, complets_gt)
+            loss_triplet_verb = ce_loss(outputs.triplet_verb_logits, triplet_verb_gt)
+            loss_triplet_subject = ce_loss(outputs.triplet_subject_logits, triplet_subject_gt)
+            loss_triplet_dest = ce_loss(outputs.triplet_destination_logits, triplet_dest_gt)
+            
+            # Create loss tensor for dynamic weighting
+            task_losses = torch.stack([
+                loss_reg, loss_cls, loss_compl, 
+                loss_triplet_verb, loss_triplet_subject, loss_triplet_dest
+            ])
+            
+            # Dynamic multi-task loss weighting
+            loss_total = loss_weighter(task_losses)
+            
+            # Scale loss for gradient accumulation if enabled
+            if USE_GRADIENT_ACCUMULATION:
+                loss_total = loss_total / GRADIENT_ACCUMULATION_STEPS
 
-            optimizer.zero_grad(set_to_none=True)
             loss_total.backward()
-            optimizer.step()
+            
+            # Gradient accumulation: only step optimizer every N accumulation steps if enabled
+            if USE_GRADIENT_ACCUMULATION:
+                if it % GRADIENT_ACCUMULATION_STEPS == 0:
+                    model_optimizer.step()
+                    weighter_optimizer.step()
+                    model_optimizer.zero_grad(set_to_none=True)
+                    weighter_optimizer.zero_grad(set_to_none=True)
+            else:
+                # Normal training: step optimizer every iteration
+                model_optimizer.step()
+                weighter_optimizer.step()
+                model_optimizer.zero_grad(set_to_none=True)
+                weighter_optimizer.zero_grad(set_to_none=True)
 
             with torch.no_grad():
-                pred_cls = logits.argmax(dim=1)
-                train_mae = torch.mean(torch.abs(reg - ttnp))
+                # Phase metrics
+                pred_cls = outputs.phase_logits.argmax(dim=1)
+                train_mae = torch.mean(torch.abs(outputs.anticipation - ttnp))
                 train_acc = (pred_cls == labels).float().mean()
-                train_cmae = torch.mean(torch.abs(completion_pred - complets_gt))
+                train_cmae = torch.mean(torch.abs(outputs.completion - complets_gt))
+                
+                # Triplet metrics
+                triplet_verb_pred = outputs.triplet_verb_logits.argmax(dim=1)
+                triplet_subject_pred = outputs.triplet_subject_logits.argmax(dim=1)
+                triplet_dest_pred = outputs.triplet_destination_logits.argmax(dim=1)
+                
+                # Combined triplet loss for logging
+                loss_triplet = (loss_triplet_verb + loss_triplet_subject + loss_triplet_dest) / 3.0
+                
+                triplet_verb_acc = (triplet_verb_pred == triplet_verb_gt).float().mean()
+                triplet_subject_acc = (triplet_subject_pred == triplet_subject_gt).float().mean()
+                triplet_dest_acc = (triplet_dest_pred == triplet_dest_gt).float().mean()
+                triplet_complete_acc = (
+                    (triplet_verb_pred == triplet_verb_gt) &
+                    (triplet_subject_pred == triplet_subject_gt) &
+                    (triplet_dest_pred == triplet_dest_gt)
+                ).float().mean()
 
             bs = frames.size(0)
             epoch_mae += float(train_mae.item()) * bs
             epoch_ce += float(loss_cls.item()) * bs
-            epoch_loss += float(loss_total.item()) * bs
+            # Unscale loss for reporting if gradient accumulation is used
+            reported_loss = loss_total.item() * (GRADIENT_ACCUMULATION_STEPS if USE_GRADIENT_ACCUMULATION else 1)
+            epoch_loss += float(reported_loss) * bs
             epoch_acc += float(train_acc.item()) * bs
             epoch_cmae += float(train_cmae.item()) * bs
+            epoch_triplet_ce += float(loss_triplet.item()) * bs
+            epoch_triplet_verb_acc += float(triplet_verb_acc.item()) * bs
+            epoch_triplet_subject_acc += float(triplet_subject_acc.item()) * bs
+            epoch_triplet_dest_acc += float(triplet_dest_acc.item()) * bs
+            epoch_triplet_complete_acc += float(triplet_complete_acc.item()) * bs
             seen += bs
 
             if it % PRINT_EVERY == 0:
-                cur_lr = scheduler.get_last_lr()[0]
+                cur_lr = model_scheduler.get_last_lr()[0]
+                task_weights = loss_weighter.get_weights().detach().cpu().numpy()
+                # Show unscaled loss for better interpretability
+                unscaled_loss = loss_total.item() * (GRADIENT_ACCUMULATION_STEPS if USE_GRADIENT_ACCUMULATION else 1)
                 print(
                     f"[Epoch {epoch:02d} | it {it:04d}] "
-                    f"loss={loss_total.item():.4f} | mae={train_mae.item():.4f} | "
+                    f"loss={unscaled_loss:.4f} | mae={train_mae.item():.4f} | "
                     f"acc={train_acc.item():.4f} | reg={loss_reg.item():.4f} | "
-                    f"cls={loss_cls.item():.4f} | compl={loss_compl.item():.4f} | lr={cur_lr:.2e}"
+                    f"cls={loss_cls.item():.4f} | compl={loss_compl.item():.4f} | "
+                    f"trip={loss_triplet.item():.4f} | trip_acc={triplet_complete_acc.item():.4f} | lr={cur_lr:.2e}"
                 )
+                print(f"           Task weights: reg={task_weights[0]:.3f}, cls={task_weights[1]:.3f}, compl={task_weights[2]:.3f}, "
+                      f"verb={task_weights[3]:.3f}, subj={task_weights[4]:.3f}, dest={task_weights[5]:.3f}")
 
         if epoch % 5 == 0:
-            print(f"GPU mem: {torch.cuda.memory_allocated() / 1e9:.4f}GB")
-            print(f"GPU cached: {torch.cuda.memory_reserved() / 1e9:.4f}GB")
+            gpu_mem_allocated = torch.cuda.memory_allocated() / 1e9
+            gpu_mem_cached = torch.cuda.memory_reserved() / 1e9
+            print(f"GPU mem: {gpu_mem_allocated:.4f}GB")
+            print(f"GPU cached: {gpu_mem_cached:.4f}GB")
+            
+            # Log GPU memory usage to wandb
+            log_to_wandb({
+                "system_gpu_memory_allocated_gb": gpu_mem_allocated,
+                "system_gpu_memory_cached_gb": gpu_mem_cached,
+            }, step=epoch)
 
             # collect
             gc.collect()
             torch.cuda.empty_cache()
 
-        # step scheduler once per epoch
-        scheduler.step()
+        # Final gradient step if there are remaining accumulated gradients and gradient accumulation is enabled
+        if USE_GRADIENT_ACCUMULATION and len(train_loader) % GRADIENT_ACCUMULATION_STEPS != 0:
+            model_optimizer.step()
+            weighter_optimizer.step()
+            model_optimizer.zero_grad(set_to_none=True)
+            weighter_optimizer.zero_grad(set_to_none=True)
+        
+        # step schedulers once per epoch
+        model_scheduler.step()
+        weighter_scheduler.step()
 
         train_loss_avg = epoch_loss / max(1, seen)
         train_mae_avg = epoch_mae / max(1, seen)
         train_ce_avg = epoch_ce / max(1, seen)
         train_acc_avg = epoch_acc / max(1, seen)
         train_cmae_avg = epoch_cmae / max(1, seen)
+        train_triplet_ce_avg = epoch_triplet_ce / max(1, seen)
+        train_triplet_verb_acc_avg = epoch_triplet_verb_acc / max(1, seen)
+        train_triplet_subject_acc_avg = epoch_triplet_subject_acc / max(1, seen)
+        train_triplet_dest_acc_avg = epoch_triplet_dest_acc / max(1, seen)
+        train_triplet_complete_acc_avg = epoch_triplet_complete_acc / max(1, seen)
+        
         print(
             f"\nEpoch {epoch:02d} [{time.time()-t0:.1f}s] "
             f"| train_loss={train_loss_avg:.4f} train_mae={train_mae_avg:.4f} "
             f"train_ce={train_ce_avg:.4f} train_acc={train_acc_avg:.4f} "
             f"train_compl_mae={train_cmae_avg:.4f}"
         )
+        print(
+            f"           triplet: ce={train_triplet_ce_avg:.4f} "
+            f"v_acc={train_triplet_verb_acc_avg:.4f} s_acc={train_triplet_subject_acc_avg:.4f} "
+            f"d_acc={train_triplet_dest_acc_avg:.4f} complete_acc={train_triplet_complete_acc_avg:.4f}"
+        )
+        
+        # Log epoch-level training metrics to wandb
+        epoch_duration = time.time() - t0
+        log_to_wandb({
+            "epoch": epoch,
+            "train_total_loss": train_loss_avg,
+            "train_mae": train_mae_avg,
+            "train_cross_entropy": train_ce_avg,
+            "train_accuracy": train_acc_avg,
+            "train_completion_mae": train_cmae_avg,
+            "train_triplet_cross_entropy": train_triplet_ce_avg,
+            "train_triplet_verb_accuracy": train_triplet_verb_acc_avg,
+            "train_triplet_subject_accuracy": train_triplet_subject_acc_avg,
+            "train_triplet_destination_accuracy": train_triplet_dest_acc_avg,
+            "train_triplet_complete_accuracy": train_triplet_complete_acc_avg,
+            "train_epoch_duration_seconds": epoch_duration,
+            "train_learning_rate": model_scheduler.get_last_lr()[0],
+            "train_samples": seen,
+        }, step=epoch)
 
         # Validation
         val_stats = evaluate(model, val_loader, device, TIME_HORIZON)
@@ -1088,25 +1490,106 @@ def train(
             f"val_acc={val_stats['acc']:.4f} val_compl_mae={val_stats['compl_mae']:.4f} "
             f"| samples={val_stats['samples']}"
         )
+        print(
+            f"           val_triplet: ce={val_stats['triplet_ce']:.4f} "
+            f"v_acc={val_stats['triplet_verb_acc']:.4f} s_acc={val_stats['triplet_subject_acc']:.4f} "
+            f"d_acc={val_stats['triplet_destination_acc']:.4f} complete_acc={val_stats['triplet_complete_acc']:.4f}"
+        )
+        
+        # Log validation metrics to wandb
+        log_to_wandb({
+            "val_mae": val_stats['mae'],
+            "val_cross_entropy": val_stats['ce'],
+            "val_accuracy": val_stats['acc'],
+            "val_completion_mae": val_stats['compl_mae'],
+            "val_triplet_cross_entropy": val_stats['triplet_ce'],
+            "val_triplet_verb_accuracy": val_stats['triplet_verb_acc'],
+            "val_triplet_subject_accuracy": val_stats['triplet_subject_acc'],
+            "val_triplet_destination_accuracy": val_stats['triplet_destination_acc'],
+            "val_triplet_complete_accuracy": val_stats['triplet_complete_acc'],
+            "val_samples": val_stats['samples'],
+        }, step=epoch)
 
         # Save best (unchanged)
-        if val_stats["mae"] < best_val_mae:
+        is_best = val_stats["mae"] < best_val_mae
+        if is_best:
             best_val_mae = val_stats["mae"]
             torch.save(model.state_dict(), CKPT_PATH)
             print(
                 f"✅  New best val_mae={best_val_mae:.4f} val_acc={val_stats['acc']:.4f} — saved to: {CKPT_PATH}"
             )
+            
+            # Log best model metrics to wandb
+            log_to_wandb({
+                "best_val_mae": best_val_mae,
+                "best_val_accuracy": val_stats['acc'],
+                "best_val_triplet_complete_accuracy": val_stats['triplet_complete_acc'],
+                "best_epoch": epoch,
+            }, step=epoch)
 
         # Always save last for resume (even if not best)
-        _save_last_checkpoint(model, optimizer, scheduler, epoch, best_val_mae, LAST_CKPT_PATH)
+        _save_last_checkpoint(model, model_optimizer, model_scheduler, epoch, best_val_mae, LAST_CKPT_PATH)
+        
+        # Log task weights to wandb
+        current_weights = loss_weighter.get_weights().detach().cpu().numpy()
+        log_to_wandb({
+            "task_weight_regression": current_weights[0],
+            "task_weight_classification": current_weights[1],
+            "task_weight_completion": current_weights[2],
+            "task_weight_triplet_verb": current_weights[3],
+            "task_weight_triplet_subject": current_weights[4],
+            "task_weight_triplet_destination": current_weights[5],
+        }, step=epoch)
 
 
 def main():
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
+    
+    # Initialize wandb if enabled (before training starts)
+    if USE_WANDB:
+        wandb.init(
+            project=WANDB_PROJECT,
+            name=WANDB_RUN_NAME,
+            config={
+                "seed": SEED,
+                "batch_size": BATCH_SIZE,
+                "use_gradient_accumulation": USE_GRADIENT_ACCUMULATION,
+                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS if USE_GRADIENT_ACCUMULATION else 1,
+                "effective_batch_size": BATCH_SIZE * (GRADIENT_ACCUMULATION_STEPS if USE_GRADIENT_ACCUMULATION else 1),
+                "num_workers": NUM_WORKERS,
+                "epochs": EPOCHS,
+                "learning_rate": LR,
+                "weight_decay": WEIGHT_DECAY,
+                "time_horizon": TIME_HORIZON,
+                "seq_len": SEQ_LEN,
+                "stride": STRIDE,
+                "num_classes": NUM_CLASSES,
+                "num_verbs": NUM_VERBS,
+                "num_subjects": NUM_SUBJECTS,
+                "num_objects": NUM_OBJECTS,
+                "time_unit": TIME_UNIT,
+                "model_hidden_channels": 384,
+                "model_num_temporal_layers": 6,
+                "model_dropout": 0.1,
+                "model_attn_heads": 8,
+                "backbone_fast": "resnet50",
+                "backbone_slow": "resnet50",
+                "architecture": "SlowFastTemporalAnticipation_v2",
+                "optimizer": "AdamW",
+                "scheduler": "CosineAnnealingLR",
+                # Multi-task learning config
+                "use_dynamic_loss_weighting": USE_DYNAMIC_LOSS_WEIGHTING,
+                "use_separate_task_encoders": USE_SEPARATE_TASK_ENCODERS,
+                "triplet_encoder_extra_layers": TRIPLET_ENCODER_EXTRA_LAYERS,
+                "cross_task_attention_weight": CROSS_TASK_ATTENTION_WEIGHT,
+                "multitask_strategy": "uncertainty_weighting_separate_encoders",
+            },
+            tags=["slowfast", "triplets", "multi-task-v2", "phase-anticipation", "uncertainty-weighting", "separate-encoders"]
+        )
 
-    # Datasets
+    # Datasets - Use triplet-based splitting for multi-task learning
     train_ds = PegAndRing(
         ROOT_DIR,
         mode="train",
@@ -1114,6 +1597,7 @@ def main():
         stride=STRIDE,
         time_unit=TIME_UNIT,
         augment=True,
+        force_triplets=True,  # Only videos with triplet annotations
     )
     val_ds = PegAndRing(
         ROOT_DIR,
@@ -1122,14 +1606,16 @@ def main():
         stride=STRIDE,
         time_unit=TIME_UNIT,
         augment=False,
+        force_triplets=True,  # Only videos with triplet annotations
     )
     test_ds = PegAndRing(
         ROOT_DIR,
-        mode="test",
+        mode="val",
         seq_len=SEQ_LEN,
         stride=STRIDE,
         time_unit=TIME_UNIT,
         augment=False,
+        force_triplets=True,  # Only videos with triplet annotations
     )
 
     # Dataloaders
@@ -1144,7 +1630,11 @@ def main():
         drop_last=False,
     )
     global PRINT_EVERY
-    PRINT_EVERY = len(train_loader) // 5
+    # Adjust print frequency for gradient accumulation if enabled
+    if USE_GRADIENT_ACCUMULATION:
+        PRINT_EVERY = (len(train_loader) // 5) * GRADIENT_ACCUMULATION_STEPS
+    else:
+        PRINT_EVERY = len(train_loader) // 5  # Print 5 times per epoch
 
     gen_eval = torch.Generator()
     gen_eval.manual_seed(SEED)
@@ -1190,6 +1680,10 @@ def main():
         use_spatial_attention=True,
         attn_heads=8,
     ).to(device)
+    
+    # Log model architecture to wandb if enabled
+    if USE_WANDB and wandb.run:
+        wandb.watch(model, log="all", log_freq=100)
 
     # ---- Training (now controlled by DO_TRAIN) ----
     if DO_TRAIN:
@@ -1210,6 +1704,42 @@ def main():
         f"acc={test_stats['acc']:.4f} compl_mae={test_stats['compl_mae']:.4f} "
         f"samples={test_stats['samples']}"
     )
+    print(
+        f"       triplet: ce={test_stats['triplet_ce']:.4f} "
+        f"v_acc={test_stats['triplet_verb_acc']:.4f} s_acc={test_stats['triplet_subject_acc']:.4f} "
+        f"d_acc={test_stats['triplet_destination_acc']:.4f} complete_acc={test_stats['triplet_complete_acc']:.4f}"
+    )
+    
+    # Log final test results to wandb
+    log_to_wandb({
+        "test_mae": test_stats['mae'],
+        "test_cross_entropy": test_stats['ce'],
+        "test_accuracy": test_stats['acc'],
+        "test_completion_mae": test_stats['compl_mae'],
+        "test_triplet_cross_entropy": test_stats['triplet_ce'],
+        "test_triplet_verb_accuracy": test_stats['triplet_verb_acc'],
+        "test_triplet_subject_accuracy": test_stats['triplet_subject_acc'],
+        "test_triplet_destination_accuracy": test_stats['triplet_destination_acc'],
+        "test_triplet_complete_accuracy": test_stats['triplet_complete_acc'],
+        "test_samples": test_stats['samples'],
+    })
+    
+    # Create summary table for wandb
+    if USE_WANDB and wandb.run:
+        summary_table = wandb.Table(
+            columns=["Metric", "Value"],
+            data=[
+                ["Test MAE", f"{test_stats['mae']:.4f}"],
+                ["Test Accuracy", f"{test_stats['acc']:.4f}"],
+                ["Test Triplet Complete Accuracy", f"{test_stats['triplet_complete_acc']:.4f}"],
+                ["Test Triplet Verb Accuracy", f"{test_stats['triplet_verb_acc']:.4f}"],
+                ["Test Triplet Subject Accuracy", f"{test_stats['triplet_subject_acc']:.4f}"],
+                ["Test Triplet Destination Accuracy", f"{test_stats['triplet_destination_acc']:.4f}"],
+                ["Model Parameters", f"{sum(p.numel() for p in model.parameters()):,}"],
+                ["Trainable Parameters", f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}"],
+            ]
+        )
+        wandb.log({"test_summary_table": summary_table})
 
     # Standard test-set visualizations
     visualize_phase_timelines_classification(
@@ -1259,6 +1789,11 @@ def main():
         out_dir=EVAL_TRAIN_ANT_TWO_DIR,
         video_filter=video_filter,
     )
+    
+    # Finish wandb run
+    if USE_WANDB and wandb.run:
+        wandb.finish()
+        print("\n📊 Wandb run completed and logged.")
 
 
 if __name__ == "__main__":
