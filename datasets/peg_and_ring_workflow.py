@@ -612,6 +612,48 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
         print(f"[OK] Saved plot -> {img_fname2}")
 
 
+def has_valid_triplet_annotations(triplet_lookup: Dict[int, Dict[str, Any]]) -> bool:
+    """
+    Check if a video has ANY non-null triplet annotations.
+    
+    A video is considered to have valid triplet annotations if at least one arm
+    (left or right) has at least one non-null action at any timestep.
+    
+    Args:
+        triplet_lookup: Dictionary mapping seconds to triplet data
+        
+    Returns:
+        True if video has at least one valid (non-null) triplet annotation
+    """
+    if not triplet_lookup:
+        return False
+    
+    NULL_VERB_IDX = TRIPLET_VERBS.index("null-verb")  # 3
+    NULL_TARGET_IDX = TRIPLET_TARGETS.index("null-target")  # 13
+    
+    for second, triplet_data in triplet_lookup.items():
+        # Check left arm
+        left_arm_data = triplet_data.get("left_arm", {})
+        left_verb = left_arm_data.get("verb", "null-verb")
+        left_dest = left_arm_data.get("destination", "null-target")
+        
+        # If left arm has non-null action, video is valid
+        if left_verb != "null-verb" or left_dest != "null-target":
+            return True
+        
+        # Check right arm
+        right_arm_data = triplet_data.get("right_arm", {})
+        right_verb = right_arm_data.get("verb", "null-verb")
+        right_dest = right_arm_data.get("destination", "null-target")
+        
+        # If right arm has non-null action, video is valid
+        if right_verb != "null-verb" or right_dest != "null-target":
+            return True
+    
+    # All timesteps for both arms are null
+    return False
+
+
 def triplet_to_classification(
     verb: str, subject: str, destination: str
 ) -> Tuple[int, int, int]:
@@ -692,6 +734,7 @@ class PegAndRing(Dataset):
         "frames_rgbd": FloatTensor [T, 4, H, W]
         # added:
         "phase_completition": torch.FloatTensor scalar in [0, 1]
+        "phase_completition_dense": torch.FloatTensor [T] in [0, 1]
         # action triplets (if available, empty strings if not available):
         "triplet_annotation": str                            # last frame triplet string
         "triplet_annotation_dense": [T] list[str]            # per-frame triplet strings
@@ -797,17 +840,31 @@ class PegAndRing(Dataset):
         if self.force_triplets:
             # Filter entries to only include videos with triplet data
             entries_with_triplets = []
+            videos_with_valid_triplets = []
+            videos_with_all_null_triplets = []
+            
             for videoname, video_path, frames_dir, frame_paths in all_entries:
                 csv_path = self.root / f"{videoname}.csv"
                 xlsx_path = self.root / f"{videoname}.xlsx"
+                
+                # Check if triplet file exists
                 if csv_path.exists() or xlsx_path.exists():
-                    entries_with_triplets.append(
-                        (videoname, video_path, frames_dir, frame_paths)
-                    )
+                    # Load triplet data to check if it contains valid (non-null) annotations
+                    triplet_file = csv_path if csv_path.exists() else xlsx_path
+                    triplet_lookup = _create_dense_triplet_lookup(triplet_file)
+                    
+                    # Only include videos with at least one valid (non-null) triplet annotation
+                    if has_valid_triplet_annotations(triplet_lookup):
+                        entries_with_triplets.append(
+                            (videoname, video_path, frames_dir, frame_paths)
+                        )
+                        videos_with_valid_triplets.append(videoname)
+                    else:
+                        videos_with_all_null_triplets.append(videoname)
 
             if not entries_with_triplets:
                 raise RuntimeError(
-                    "No videos with triplet data found when force_triplets=True"
+                    "No videos with valid (non-null) triplet annotations found when force_triplets=True"
                 )
 
             # Deterministic 80%-20% split based on sorted video names
@@ -826,7 +883,14 @@ class PegAndRing(Dataset):
                 entries = val_entries
 
             print(
-                f"[INFO] Using triplet-based split: {len(train_entries)} train, {len(val_entries)} val videos"
+                f"[INFO] Triplet filtering results:"
+            )
+            print(f"  - Videos with valid triplet annotations: {len(videos_with_valid_triplets)}")
+            if videos_with_all_null_triplets:
+                print(f"  - Videos with ALL null-triplets (excluded): {len(videos_with_all_null_triplets)}")
+                print(f"    Excluded videos: {', '.join(videos_with_all_null_triplets)}")
+            print(
+                f"  - Split: {len(train_entries)} train, {len(val_entries)} val videos"
             )
         else:
             # Use original hard-coded validation split
@@ -1107,6 +1171,7 @@ class PegAndRing(Dataset):
                         "prev_phases": prev_phases,
                         "prev_anticipation": prev_anticipation,
                         "phase_completition": completion_last,  # scalar float in [0,1]
+                        "phase_completition_dense": completion_arr[frame_idxs],  # [T] float32
                         # Action triplet information (legacy single triplet for backward compatibility)
                         "triplet_annotation": triplet_annotation_last,
                         "triplet_annotation_dense": triplet_annotations_dense,
@@ -1365,6 +1430,9 @@ class PegAndRing(Dataset):
         # convert precomputed completion scalar to torch tensor in [0,1]
         meta["phase_completition"] = torch.tensor(
             float(meta["phase_completition"]), dtype=torch.float32
+        )
+        meta["phase_completition_dense"] = torch.tensor(
+            meta["phase_completition_dense"], dtype=torch.float32
         )
 
         if (
