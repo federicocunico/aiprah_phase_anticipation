@@ -33,8 +33,17 @@ from torchvision.transforms import (
 VIDEO_RE = re.compile(r"video\d{2}\.mp4$", re.IGNORECASE)
 NUM_CLASSES = 6  # phases 0..5
 
-TRIPLET_VERBS = ["reach", "grasp", "release", "null-verb"]  # 0, 1, 2, 3  (null for initial/ending states)
-TRIPLET_SUBJECTS = ["left_arm", "right_arm", "null-subject"]  # 0, 1, 2  (null for initial/ending states)
+TRIPLET_VERBS = [
+    "reach",
+    "grasp",
+    "release",
+    "null-verb",
+]  # 0, 1, 2, 3  (null for initial/ending states)
+TRIPLET_SUBJECTS = [
+    "left_arm",
+    "right_arm",
+    "null-subject",
+]  # 0, 1, 2  (null for initial/ending states)
 TRIPLET_TARGETS = [
     # Pegs RGBYGr : 0, 1, 2, 3, 4
     "red_peg",
@@ -202,13 +211,17 @@ def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
         max_sec = df_parsed["seconds"].max()
 
         # Sort annotations by time and group by arm
-        left_arm_annotations = df_parsed[df_parsed["subject"] == "left_arm"].sort_values("seconds")
-        right_arm_annotations = df_parsed[df_parsed["subject"] == "right_arm"].sort_values("seconds")
-        
+        left_arm_annotations = df_parsed[
+            df_parsed["subject"] == "left_arm"
+        ].sort_values("seconds")
+        right_arm_annotations = df_parsed[
+            df_parsed["subject"] == "right_arm"
+        ].sort_values("seconds")
+
         def create_arm_timeline(annotations):
             """Create timeline for one arm with proper action propagation and multi-action handling"""
             timeline = {}
-            
+
             if annotations.empty:
                 # No annotations for this arm, fill with null values
                 for sec in range(min_sec, max_sec + 1):
@@ -217,10 +230,10 @@ def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
                         "triplet": ("null-verb", "null-subject", "null-target"),
                         "verb": "null-verb",
                         "subject": "null-subject",
-                        "destination": "null-target"
+                        "destination": "null-target",
                     }
                 return timeline
-            
+
             # Initialize all seconds with null values first
             for sec in range(min_sec, max_sec + 1):
                 timeline[sec] = {
@@ -228,54 +241,64 @@ def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
                     "triplet": ("null-verb", "null-subject", "null-target"),
                     "verb": "null-verb",
                     "subject": "null-subject",
-                    "destination": "null-target"
+                    "destination": "null-target",
                 }
-            
+
             # Group annotations by second to handle multiple actions at same time
             actions_by_second = {}
             for _, row in annotations.iterrows():
                 sec = row["seconds"]
                 if sec not in actions_by_second:
                     actions_by_second[sec] = []
-                actions_by_second[sec].append({
-                    "verb": row["verb"],
-                    "annotation": row["annotation"],
-                    "subject": row["subject"],
-                    "destination": row["destination"]
-                })
-            
+                actions_by_second[sec].append(
+                    {
+                        "verb": row["verb"],
+                        "annotation": row["annotation"],
+                        "subject": row["subject"],
+                        "destination": row["destination"],
+                    }
+                )
+
             # Process each second in chronological order
             sorted_seconds = sorted(actions_by_second.keys())
-            
+
             for i, current_sec in enumerate(sorted_seconds):
                 actions_at_sec = actions_by_second[current_sec]
-                
+
                 # Handle multiple actions at the same second
                 # Priority: release > grasp > reach > null (most definitive action wins)
                 primary_action = None
                 action_priority = {"release": 3, "grasp": 2, "reach": 1, "null-verb": 0}
-                
+
                 for action in actions_at_sec:
                     current_priority = action_priority.get(action["verb"], 0)
-                    if primary_action is None or current_priority > action_priority.get(primary_action["verb"], 0):
+                    if (
+                        primary_action is None
+                        or current_priority
+                        > action_priority.get(primary_action["verb"], 0)
+                    ):
                         primary_action = action
-                
+
                 # Find the next action time for propagation
                 if i + 1 < len(sorted_seconds):
                     next_sec = sorted_seconds[i + 1]
                 else:
                     next_sec = max_sec + 1  # Propagate until the end
-                
+
                 # Apply the primary action at the current second
                 action_data = {
                     "annotation": primary_action["annotation"],
-                    "triplet": (primary_action["verb"], primary_action["subject"], primary_action["destination"]),
+                    "triplet": (
+                        primary_action["verb"],
+                        primary_action["subject"],
+                        primary_action["destination"],
+                    ),
                     "verb": primary_action["verb"],
                     "subject": primary_action["subject"],
-                    "destination": primary_action["destination"]
+                    "destination": primary_action["destination"],
                 }
                 timeline[current_sec] = action_data
-                
+
                 # Apply propagation rules based on the primary action
                 if primary_action["verb"] in ["reach", "grasp"]:
                     # "reach" and "grasp" propagate until the next action
@@ -289,30 +312,30 @@ def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
                         "triplet": ("null-verb", "null-subject", "null-target"),
                         "verb": "null-verb",
                         "subject": "null-subject",
-                        "destination": "null-target"
+                        "destination": "null-target",
                     }
                     for sec in range(current_sec + 1, next_sec):
                         if sec <= max_sec:
                             timeline[sec] = null_data.copy()
                 else:
-                    # For other verbs (like "null-verb"), don't propagate  
+                    # For other verbs (like "null-verb"), don't propagate
                     null_data = {
                         "annotation": "null-verb(null-subject, null-target)",
                         "triplet": ("null-verb", "null-subject", "null-target"),
                         "verb": "null-verb",
                         "subject": "null-subject",
-                        "destination": "null-target"
+                        "destination": "null-target",
                     }
                     for sec in range(current_sec + 1, next_sec):
                         if sec <= max_sec:
                             timeline[sec] = null_data.copy()
-            
+
             return timeline
-        
+
         # Create timelines for both arms
         left_timeline = create_arm_timeline(left_arm_annotations)
         right_timeline = create_arm_timeline(right_arm_annotations)
-        
+
         # Build the dense lookup combining both arms
         dense_lookup = {}
         current_triplet = None
@@ -320,11 +343,11 @@ def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
         current_verb = None
         current_subject = None
         current_destination = None
-        
+
         for sec in range(min_sec, max_sec + 1):
             left_arm_data = left_timeline[sec]
             right_arm_data = right_timeline[sec]
-            
+
             # For backward compatibility, use the first non-null triplet we encounter
             # Priority: left arm first, then right arm
             if left_arm_data["verb"] != "null-verb":
@@ -346,7 +369,7 @@ def _create_dense_triplet_lookup(file_path: Path) -> Dict[int, Dict[str, Any]]:
                 current_subject = "null-subject"
                 current_destination = "null-target"
                 current_triplet = ("null-verb", "null-subject", "null-target")
-            
+
             # Store both arm triplets for this second, plus legacy single triplet for backward compatibility
             dense_lookup[sec] = {
                 # Legacy single triplet (for backward compatibility)
@@ -615,41 +638,41 @@ def _show_plot(time_horizon: float | None = 1.0, fps: int = 1):
 def has_valid_triplet_annotations(triplet_lookup: Dict[int, Dict[str, Any]]) -> bool:
     """
     Check if a video has ANY non-null triplet annotations.
-    
+
     A video is considered to have valid triplet annotations if at least one arm
     (left or right) has at least one non-null action at any timestep.
-    
+
     Args:
         triplet_lookup: Dictionary mapping seconds to triplet data
-        
+
     Returns:
         True if video has at least one valid (non-null) triplet annotation
     """
     if not triplet_lookup:
         return False
-    
+
     NULL_VERB_IDX = TRIPLET_VERBS.index("null-verb")  # 3
     NULL_TARGET_IDX = TRIPLET_TARGETS.index("null-target")  # 13
-    
+
     for second, triplet_data in triplet_lookup.items():
         # Check left arm
         left_arm_data = triplet_data.get("left_arm", {})
         left_verb = left_arm_data.get("verb", "null-verb")
         left_dest = left_arm_data.get("destination", "null-target")
-        
+
         # If left arm has non-null action, video is valid
         if left_verb != "null-verb" or left_dest != "null-target":
             return True
-        
+
         # Check right arm
         right_arm_data = triplet_data.get("right_arm", {})
         right_verb = right_arm_data.get("verb", "null-verb")
         right_dest = right_arm_data.get("destination", "null-target")
-        
+
         # If right arm has non-null action, video is valid
         if right_verb != "null-verb" or right_dest != "null-target":
             return True
-    
+
     # All timesteps for both arms are null
     return False
 
@@ -660,7 +683,11 @@ def triplet_to_classification(
     ## Convert triplet strings to classification indices.
 
     if verb == subject == destination == "":
-        return TRIPLET_VERBS.index("null-verb"), TRIPLET_SUBJECTS.index("null-subject"), TRIPLET_TARGETS.index("null-target")
+        return (
+            TRIPLET_VERBS.index("null-verb"),
+            TRIPLET_SUBJECTS.index("null-subject"),
+            TRIPLET_TARGETS.index("null-target"),
+        )
 
     verb_valid = verb in TRIPLET_VERBS
     subject_valid = subject in TRIPLET_SUBJECTS
@@ -842,17 +869,17 @@ class PegAndRing(Dataset):
             entries_with_triplets = []
             videos_with_valid_triplets = []
             videos_with_all_null_triplets = []
-            
+
             for videoname, video_path, frames_dir, frame_paths in all_entries:
                 csv_path = self.root / f"{videoname}.csv"
                 xlsx_path = self.root / f"{videoname}.xlsx"
-                
+
                 # Check if triplet file exists
                 if csv_path.exists() or xlsx_path.exists():
                     # Load triplet data to check if it contains valid (non-null) annotations
                     triplet_file = csv_path if csv_path.exists() else xlsx_path
                     triplet_lookup = _create_dense_triplet_lookup(triplet_file)
-                    
+
                     # Only include videos with at least one valid (non-null) triplet annotation
                     if has_valid_triplet_annotations(triplet_lookup):
                         entries_with_triplets.append(
@@ -882,13 +909,17 @@ class PegAndRing(Dataset):
             else:  # val or test
                 entries = val_entries
 
+            print(f"[INFO] Triplet filtering results:")
             print(
-                f"[INFO] Triplet filtering results:"
+                f"  - Videos with valid triplet annotations: {len(videos_with_valid_triplets)}"
             )
-            print(f"  - Videos with valid triplet annotations: {len(videos_with_valid_triplets)}")
             if videos_with_all_null_triplets:
-                print(f"  - Videos with ALL null-triplets (excluded): {len(videos_with_all_null_triplets)}")
-                print(f"    Excluded videos: {', '.join(videos_with_all_null_triplets)}")
+                print(
+                    f"  - Videos with ALL null-triplets (excluded): {len(videos_with_all_null_triplets)}"
+                )
+                print(
+                    f"    Excluded videos: {', '.join(videos_with_all_null_triplets)}"
+                )
             print(
                 f"  - Split: {len(train_entries)} train, {len(val_entries)} val videos"
             )
@@ -1076,7 +1107,7 @@ class PegAndRing(Dataset):
                 triplet_verbs_dense = []
                 triplet_subjects_dense = []
                 triplet_destinations_dense = []
-                
+
                 # New dual-arm support
                 triplet_left_annotations_dense = []
                 triplet_left_verbs_dense = []
@@ -1096,18 +1127,34 @@ class PegAndRing(Dataset):
                     triplet_destinations_dense.append(
                         triplet_data.get("destination", "")
                     )
-                    
+
                     # New dual-arm triplets
                     left_arm_data = triplet_data.get("left_arm", {})
                     right_arm_data = triplet_data.get("right_arm", {})
-                    
-                    triplet_left_annotations_dense.append(left_arm_data.get("annotation", "null-verb(null-subject, null-target)"))
-                    triplet_left_verbs_dense.append(left_arm_data.get("verb", "null-verb"))
-                    triplet_left_destinations_dense.append(left_arm_data.get("destination", "null-target"))
-                    
-                    triplet_right_annotations_dense.append(right_arm_data.get("annotation", "null-verb(null-subject, null-target)"))
-                    triplet_right_verbs_dense.append(right_arm_data.get("verb", "null-verb"))
-                    triplet_right_destinations_dense.append(right_arm_data.get("destination", "null-target"))
+
+                    triplet_left_annotations_dense.append(
+                        left_arm_data.get(
+                            "annotation", "null-verb(null-subject, null-target)"
+                        )
+                    )
+                    triplet_left_verbs_dense.append(
+                        left_arm_data.get("verb", "null-verb")
+                    )
+                    triplet_left_destinations_dense.append(
+                        left_arm_data.get("destination", "null-target")
+                    )
+
+                    triplet_right_annotations_dense.append(
+                        right_arm_data.get(
+                            "annotation", "null-verb(null-subject, null-target)"
+                        )
+                    )
+                    triplet_right_verbs_dense.append(
+                        right_arm_data.get("verb", "null-verb")
+                    )
+                    triplet_right_destinations_dense.append(
+                        right_arm_data.get("destination", "null-target")
+                    )
 
                 # Get triplet data for the last frame (used as window-level triplet)
                 last_frame_second = frame_idx_to_second(frame_idxs[-1])
@@ -1125,19 +1172,27 @@ class PegAndRing(Dataset):
                 triplet_classification_tensor = torch.as_tensor(
                     triplet_classification, dtype=torch.long
                 )
-                
-                # New dual-arm triplets for the last frame  
+
+                # New dual-arm triplets for the last frame
                 last_left_arm_data = last_triplet_data.get("left_arm", {})
                 last_right_arm_data = last_triplet_data.get("right_arm", {})
-                
-                triplet_left_annotation_last = last_left_arm_data.get("annotation", "null-verb(null-subject, null-target)")
+
+                triplet_left_annotation_last = last_left_arm_data.get(
+                    "annotation", "null-verb(null-subject, null-target)"
+                )
                 triplet_left_verb_last = last_left_arm_data.get("verb", "null-verb")
-                triplet_left_destination_last = last_left_arm_data.get("destination", "null-target")
-                
-                triplet_right_annotation_last = last_right_arm_data.get("annotation", "null-verb(null-subject, null-target)")
+                triplet_left_destination_last = last_left_arm_data.get(
+                    "destination", "null-target"
+                )
+
+                triplet_right_annotation_last = last_right_arm_data.get(
+                    "annotation", "null-verb(null-subject, null-target)"
+                )
                 triplet_right_verb_last = last_right_arm_data.get("verb", "null-verb")
-                triplet_right_destination_last = last_right_arm_data.get("destination", "null-target")
-                
+                triplet_right_destination_last = last_right_arm_data.get(
+                    "destination", "null-target"
+                )
+
                 # Create classification tensors for both arms
                 triplet_left_classification = triplet_to_classification(
                     triplet_left_verb_last, "left_arm", triplet_left_destination_last
@@ -1145,7 +1200,7 @@ class PegAndRing(Dataset):
                 triplet_left_classification_tensor = torch.as_tensor(
                     triplet_left_classification, dtype=torch.long
                 )
-                
+
                 triplet_right_classification = triplet_to_classification(
                     triplet_right_verb_last, "right_arm", triplet_right_destination_last
                 )
@@ -1171,7 +1226,9 @@ class PegAndRing(Dataset):
                         "prev_phases": prev_phases,
                         "prev_anticipation": prev_anticipation,
                         "phase_completition": completion_last,  # scalar float in [0,1]
-                        "phase_completition_dense": completion_arr[frame_idxs],  # [T] float32
+                        "phase_completition_dense": completion_arr[
+                            frame_idxs
+                        ],  # [T] float32
                         # Action triplet information (legacy single triplet for backward compatibility)
                         "triplet_annotation": triplet_annotation_last,
                         "triplet_annotation_dense": triplet_annotations_dense,
@@ -1566,6 +1623,7 @@ class VideoBatchSampler(BatchSampler):
 
 # -------------------------------------------------------------------------------------
 
+
 def __test():
 
     # _show_plot(1, 1)
@@ -1685,7 +1743,7 @@ def __test():
         )
         if i > 10:
             break
-    
+
     gen_train = torch.Generator()
     gen_train.manual_seed(42)
     train_batch_sampler_fixed = VideoBatchSampler(
@@ -1784,29 +1842,273 @@ def __test():
     ):
         pass
 
+
+def check_and_fix_triplet_annotations():
+    from glob import glob
+    import shutil
+
+    csvs_xlsx = glob("data/peg_and_ring_workflow/*.csv") + glob(
+        "data/peg_and_ring_workflow/*.xlsx"
+    )
+    
+    # example:
+    # -------------------------
+    # time,annotation
+    # 00:14,"reach(right_arm, green_ring)"
+    # 00:15,"reach(right_arm, green_ring)"
+    # 00:16,"reach(right_arm, green_ring)"
+    # 00:17,"reach(right_arm, green_ring)"
+    # 00:18,"reach(right_arm, green_ring)"
+    # 00:19,"grasp(right_arm, green_ring)"
+
+    # try fix: for each csv/xlsx, create a backup (.bak) if not present and write a cleaned .csv
+    for path in csvs_xlsx:
+        # skip any already-fixed files
+        if "fixed" in path:
+            continue
+
+        print("Checking file:", path)
+
+        # backup path (original moved here if we need to change the file)
+        bak_path = path + ".bak"
+
+        # target csv path (always save as .csv)
+        base_no_ext = os.path.splitext(path)[0]
+        target_csv = base_no_ext + ".csv"
+
+        # If a backup already exists, assume this file was already processed and skip
+        if os.path.exists(bak_path):
+            print("  Backup exists, skipping:", bak_path)
+            continue
+
+        # Load original (csv or xlsx). We read the original file from 'path' and then will move it to bak_path
+        if path.endswith(".csv"):
+            df = pd.read_csv(path)
+        else:
+            # some files are CSV-saved-as-XLSX: treat them as single-column Excel and reparse
+            df = pd.read_excel(path, header=None)
+            cols = df.iloc[0].tolist()[0]
+            cols = cols.split(",")
+            fixed = []
+            for raw_r in df.iterrows():
+                idx, r = raw_r
+                if idx == 0:
+                    continue
+                # manual parse
+                r_time = r[0][0:5]
+                r_ann = r[0][6:].replace('"', '')
+                fixed.append([r_time, r_ann])
+
+            fixed.insert(0, cols)
+            # recreate pandas
+            df = pd.DataFrame(fixed[1:], columns=fixed[0])
+
+        # Normalize common broken formats into a 2-column dataframe [time, annotation]
+        if df.shape[1] == 1:
+            first_col = df.columns[0]
+            new_rows = []
+            for i, row in df.iterrows():
+                parts = row[first_col].split(",", 1)
+                if len(parts) == 2:
+                    new_rows.append({"time": parts[0].strip(), "annotation": parts[1].strip().strip('"')})
+                else:
+                    new_rows.append({"time": "", "annotation": ""})
+            df = pd.DataFrame(new_rows)
+        elif df.shape[1] == 2:
+            expected_cols = ["time", "annotation"]
+            if list(df.columns) != expected_cols:
+                df.columns = expected_cols
+
+            # ensure columns accept string assignment
+            if "annotation" in df.columns:
+                df["annotation"] = df["annotation"].astype(object)
+            if "time" in df.columns:
+                df["time"] = df["time"].astype(object)
+
+            for i, row in df.iterrows():
+                ann = row["annotation"]
+                time = row["time"]
+                if pd.isna(ann) and isinstance(time, str) and "," in time:
+                    parts = time.split(",", 1)
+                    if len(parts) == 2:
+                        df.at[i, "time"] = parts[0].strip()
+                        df.at[i, "annotation"] = parts[1].strip().strip('"')
+        else:
+            print("  Unrecognized format with", df.shape[1], "columns. Skipping.")
+            continue
+
+        # At this point df is the cleaned table. Move original to backup and write the cleaned CSV.
+        try:
+            # move original file to .bak (this removes the original)
+            shutil.move(path, bak_path)
+            # write cleaned CSV to target path (overwrites if target existed because we moved original)
+            print("Preview of cleaned data:")
+            print(df.head())
+            df.to_csv(target_csv, index=False)
+            print("  Backed up original to:", bak_path)
+            print("  Saved cleaned CSV to:", target_csv)
+        except Exception as e:
+            print(f"  Failed to backup/overwrite '{path}': {e}")
+            # if move failed but target exists (unlikely), try to cleanup by ensuring bak doesn't exist partially
+            continue
+
+    all_triplets_set = set()
+    all_triplets = []
+    err = []
+    csvs = glob("data/peg_and_ring_workflow/video*.csv")
+    for path in csvs:
+        df = pd.read_csv(path)
+        col = "annotation"
+        for i, row in df.iterrows():
+            ann = row[col]
+            if not isinstance(ann, str):
+                print(f"  Row {i}: invalid annotation (not a string):", ann)
+                continue
+            if ann.count("(") != 1 or ann.count(")") != 1 or ann.count(",") != 1:
+                print(f"  Row {i}: invalid annotation format:", ann)
+                continue
+            verb = ann.split("(")[0].strip()
+            rest = ann.split("(")[1].split(")")[0]
+            subject = rest.split(",")[0].strip()
+            destination = rest.split(",")[1].strip()
+
+            if subject not in TRIPLET_SUBJECTS:
+                err.append((path, "subject", subject))
+            if destination not in TRIPLET_TARGETS:
+                err.append((path, "target", destination))
+            if verb not in TRIPLET_VERBS:
+                err.append((path, "verb", verb))
+            all_triplets_set.add((verb, subject, destination))
+            all_triplets.append((verb, subject, destination))
+    if len(err) == 0:
+        print("All CSV/XLSX annotations look good!")
+    else:
+        print("Found annotation errors:")
+        for e in err:
+            print(" ", e)
+    
+    print("Unique triplets found: ", len(all_triplets_set))
+    print("Total triplet annotations found: ", len(all_triplets))
+    print(f"coming from {len(TRIPLET_VERBS)} verbs, {len(TRIPLET_SUBJECTS)} subjects, {len(TRIPLET_TARGETS)} targets")
+
+    return
+
+
 if __name__ == "__main__":
+
+    check_and_fix_triplet_annotations()
+
+    # Build a small dataset to inspect triplet annotations and generate micro-videos
     ds_train = PegAndRing(
         root_dir="data/peg_and_ring_workflow",
         mode="train",
-        seq_len=1,
+        seq_len=8,
         stride=1,
         fps=1,
         time_unit="minutes",
         force_triplets=True,
     )
-    all_triplets = {}
-    for i in range(len(ds_train)):
-        frames, meta = ds_train[i]
-        video_fname = meta['video_name']
-        if video_fname != "video00":
+
+    print("Total windows (triplet split):", len(ds_train))
+
+    # output dir for micro videos
+    out_dir = Path("data/peg_and_ring_workflow/_micro_videos")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # limits to avoid generating too many videos during quick checks
+    windows_per_video = 3
+    max_videos = 30
+
+    processed_counts: Dict[str, int] = {}
+    videos_generated = 0
+
+    # iterate by index to access dataset attributes (mean/std) for un-normalization
+    for idx in range(len(ds_train)):
+        if idx % 5 != 0:
+            continue
+        frames, meta = ds_train[idx]
+        video_fname = meta["video_name"]
+
+        # ensure we don't generate too many per video or overall
+        processed_counts.setdefault(video_fname, 0)
+        if processed_counts[video_fname] >= windows_per_video:
+            continue
+        if videos_generated >= max_videos:
             break
-        
-        left_triplet = "{}({}, {})".format(meta['triplet_left_verb'], 'left_arm', meta['triplet_left_destination'])
-        right_triplet = "{}({}, {})".format(meta['triplet_right_verb'], 'right_arm', meta['triplet_right_destination'])
-        
-        if not video_fname in all_triplets:
-            all_triplets[video_fname] = []
-        all_triplets[video_fname].append((left_triplet, right_triplet))
 
-    print("All triplets found:")
+        # frames: tensor [T, C, H, W] normalized; un-normalize to uint8 RGB
+        try:
+            frames_np = frames.detach().cpu().numpy()
+        except Exception:
+            frames_np = frames.cpu().numpy()
 
+        # dataset mean/std are tensors shaped (3,1,1)
+        mean = ds_train.mean.cpu().numpy().reshape(3, 1, 1)
+        std = ds_train.std.cpu().numpy().reshape(3, 1, 1)
+
+        frames_np = frames_np * std + mean
+        frames_np = np.clip(frames_np, 0.0, 1.0)
+        frames_np = (frames_np * 255.0).astype(np.uint8)
+
+        # convert to H,W,3 per frame and BGR for OpenCV
+        frames_rgb = frames_np.transpose(0, 2, 3, 1)  # T, H, W, C (RGB)
+        frames_bgr = frames_rgb[:, :, :, ::-1]
+
+        T, H, W, C = frames_bgr.shape
+
+        # overlay triplet annotations on each frame
+        left_ann = str(meta.get("triplet_left_annotation", ""))
+        right_ann = str(meta.get("triplet_right_annotation", ""))
+
+        overlayed = []
+        for t in range(T):
+            img = frames_bgr[t].copy()
+            # Put left/right texts
+            cv2.putText(
+                img,
+                f"L: {left_ann}",
+                (6, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                img,
+                f"R: {right_ann}",
+                (6, 36),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            # also annotate frame index and phase completion
+            phase_comp = float(meta.get("phase_completition", 0.0))
+            cv2.putText(
+                img,
+                f"idx:{idx} frm:{t} comp:{phase_comp:.2f}",
+                (6, H - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            overlayed.append(img)
+
+        # write micro-video
+        out_path = out_dir / f"{video_fname}_micro_{processed_counts[video_fname]}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_path), fourcc, float(ds_train.fps or 1.0), (W, H))
+        for img in overlayed:
+            writer.write(img)
+        writer.release()
+
+        print(f"Saved micro-video: {out_path} (T={T}, {W}x{H}) — L='{left_ann}' R='{right_ann}'")
+
+        processed_counts[video_fname] += 1
+        videos_generated += 1
+
+    print("Micro-video generation done. Check:", out_dir)

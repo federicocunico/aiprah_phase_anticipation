@@ -195,10 +195,8 @@ def add_triplet_overlays(
     right_pred_triplet: str = None,
 ) -> np.ndarray:
     """
-    Overlay triplet information directly on the frame.
-    
-    Left side: Left arm information (GT + predictions)
-    Right side: Right arm information (GT + predictions)
+    Overlay triplet information in a compact horizontal bar format.
+    Optimized layout with minimal frame obstruction.
     
     Args:
         frame: BGR image as numpy array
@@ -209,120 +207,134 @@ def add_triplet_overlays(
         right_pred_triplet: Right arm predicted triplet (optional)
 
     Returns:
-        Frame with overlaid triplet information
+        Frame with compact overlaid triplet information
     """
-    # Work on a copy of the frame
     overlay_frame = frame.copy()
     height, width = overlay_frame.shape[:2]
 
-    # Colors
-    gt_color = (0, 255, 0)  # Green for ground truth
-    pred_color = (0, 100, 255)  # Orange for predictions
-    text_color = (255, 255, 255)  # White for labels
-    dash_color = (100, 100, 100)  # Gray for dashes
-    bg_color = (0, 0, 0)  # Black background for text
-
-    # Font properties
+    # Colors (BGR format)
+    gt_color = (50, 255, 50)        # Bright green for GT
+    pred_color = (50, 150, 255)     # Orange for predictions
+    left_bg = (40, 40, 40)          # Dark gray for left arm
+    right_bg = (60, 40, 40)         # Slightly different for right arm
+    header_bg = (20, 20, 20)        # Very dark for header
+    text_white = (255, 255, 255)
+    text_gray = (180, 180, 180)
+    divider_color = (100, 100, 100)
+    
+    # Font settings
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    small_font_scale = 0.4
-    thickness = 2
-    line_height = 20
-
-    # Helper function to add text with background
-    def add_text_with_bg(img, text, pos, color, bg_color=bg_color, font_scale=font_scale, thickness=thickness):
-        # Get text size for background rectangle
-        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-        
-        # Draw background rectangle
-        cv2.rectangle(img, 
-                      (pos[0] - 2, pos[1] - text_height - 2), 
-                      (pos[0] + text_width + 2, pos[1] + baseline + 2), 
-                      bg_color, -1)
-        
-        # Draw text
-        cv2.putText(img, text, pos, font, font_scale, color, thickness)
-
+    font_bold = cv2.FONT_HERSHEY_DUPLEX
+    
     # Parse triplets
-    left_verb, left_subject, left_target = parse_triplet(left_triplet)
-    right_verb, right_subject, right_target = parse_triplet(right_triplet)
-
-    # === LEFT SIDE (Left arm information) ===
-    left_x = 10
-    y_pos = 30
-
-    # Frame index at top
-    add_text_with_bg(overlay_frame, f"Frame: {frame_idx}", (width//2 - 50, y_pos), text_color, font_scale=0.6)
+    left_verb, _, left_target = parse_triplet(left_triplet)
+    right_verb, _, right_target = parse_triplet(right_triplet)
     
-    # Left arm section
-    y_pos = 60
-    add_text_with_bg(overlay_frame, "LEFT ARM", (left_x, y_pos), text_color, font_scale=0.6)
-    y_pos += line_height + 5
-
-    # Ground truth
-    add_text_with_bg(overlay_frame, "GT:", (left_x, y_pos), text_color, font_scale=small_font_scale)
-    y_pos += line_height
-    add_text_with_bg(overlay_frame, f"  {left_verb}", (left_x, y_pos), gt_color, font_scale=small_font_scale)
-    y_pos += line_height
-    add_text_with_bg(overlay_frame, f"  {left_target}", (left_x, y_pos), gt_color, font_scale=small_font_scale)
-    y_pos += line_height + 5
-
-    # Predictions (if available)
+    # Prepare prediction data if available
+    left_pred_verb, left_pred_target = None, None
+    right_pred_verb, right_pred_target = None, None
     if left_pred_triplet:
-        pred_verb, pred_subject, pred_target = parse_triplet(left_pred_triplet)
-        add_text_with_bg(overlay_frame, "PRED:", (left_x, y_pos), text_color, font_scale=small_font_scale)
-        y_pos += line_height
-        add_text_with_bg(overlay_frame, f"  {pred_verb}", (left_x, y_pos), pred_color, font_scale=small_font_scale)
-        y_pos += line_height
-        add_text_with_bg(overlay_frame, f"  {pred_target}", (left_x, y_pos), pred_color, font_scale=small_font_scale)
-    else:
-        add_text_with_bg(overlay_frame, "PRED: ----", (left_x, y_pos), dash_color, font_scale=small_font_scale)
-
-    # === RIGHT SIDE (Right arm information) ===
-    right_x = width - 150  # Position from right edge
-    y_pos = 60
-
-    # Right arm section
-    add_text_with_bg(overlay_frame, "RIGHT ARM", (right_x, y_pos), text_color, font_scale=0.6)
-    y_pos += line_height + 5
-
-    # Ground truth
-    add_text_with_bg(overlay_frame, "GT:", (right_x, y_pos), text_color, font_scale=small_font_scale)
-    y_pos += line_height
-    add_text_with_bg(overlay_frame, f"  {right_verb}", (right_x, y_pos), gt_color, font_scale=small_font_scale)
-    y_pos += line_height
-    add_text_with_bg(overlay_frame, f"  {right_target}", (right_x, y_pos), gt_color, font_scale=small_font_scale)
-    y_pos += line_height + 5
-
-    # Predictions (if available)
+        left_pred_verb, _, left_pred_target = parse_triplet(left_pred_triplet)
     if right_pred_triplet:
-        pred_verb, pred_subject, pred_target = parse_triplet(right_pred_triplet)
-        add_text_with_bg(overlay_frame, "PRED:", (right_x, y_pos), text_color, font_scale=small_font_scale)
-        y_pos += line_height
-        add_text_with_bg(overlay_frame, f"  {pred_verb}", (right_x, y_pos), pred_color, font_scale=small_font_scale)
-        y_pos += line_height
-        add_text_with_bg(overlay_frame, f"  {pred_target}", (right_x, y_pos), pred_color, font_scale=small_font_scale)
+        right_pred_verb, _, right_pred_target = parse_triplet(right_pred_triplet)
+    
+    # ===== TOP BAR: Compact info bar =====
+    bar_height = 75  # Compact height for info bar
+    
+    # Create semi-transparent overlay for top bar
+    overlay = overlay_frame.copy()
+    cv2.rectangle(overlay, (0, 0), (width, bar_height), header_bg, -1)
+    cv2.addWeighted(overlay, 0.85, overlay_frame, 0.15, 0, overlay_frame)
+    
+    # Draw divider line
+    cv2.line(overlay_frame, (0, bar_height), (width, bar_height), divider_color, 2)
+    
+    # === Layout: Frame Index (center top) ===
+    frame_text = f"Frame: {frame_idx}"
+    (fw, fh), _ = cv2.getTextSize(frame_text, font_bold, 0.6, 2)
+    cv2.putText(overlay_frame, frame_text, (width//2 - fw//2, 25), 
+                font_bold, 0.6, text_white, 2)
+    
+    # === Vertical divider in the middle ===
+    mid_x = width // 2
+    cv2.line(overlay_frame, (mid_x, 35), (mid_x, bar_height - 5), divider_color, 1)
+    
+    # ===== LEFT HALF: Left Arm =====
+    left_section_x = 10
+    y = 50
+    
+    # Label
+    cv2.putText(overlay_frame, "L-ARM", (left_section_x, y), 
+                font, 0.45, text_gray, 1)
+    
+    # GT info (compact horizontal layout)
+    gt_text = f"GT: {left_verb} -> {left_target}"
+    cv2.putText(overlay_frame, gt_text, (left_section_x + 55, y), 
+                font, 0.4, gt_color, 1)
+    
+    # Prediction (if available)
+    y += 20
+    if left_pred_verb and left_pred_target:
+        pred_text = f"PR: {left_pred_verb} -> {left_pred_target}"
+        cv2.putText(overlay_frame, pred_text, (left_section_x + 55, y), 
+                    font, 0.4, pred_color, 1)
     else:
-        add_text_with_bg(overlay_frame, "PRED: ----", (right_x, y_pos), dash_color, font_scale=small_font_scale)
-
-    # Add bottom status line with full triplets (smaller text)
-    bottom_y = height - 30
-    full_left = f"L: {left_triplet}"
-    full_right = f"R: {right_triplet}"
+        cv2.putText(overlay_frame, "PR: ----", (left_section_x + 55, y), 
+                    font, 0.4, text_gray, 1)
     
-    # Truncate if too long
-    max_chars = 35
-    if len(full_left) > max_chars:
-        full_left = full_left[:max_chars-3] + "..."
-    if len(full_right) > max_chars:
-        full_right = full_right[:max_chars-3] + "..."
+    # ===== RIGHT HALF: Right Arm =====
+    right_section_x = mid_x + 10
+    y = 50
     
-    add_text_with_bg(overlay_frame, full_left, (10, bottom_y), gt_color, font_scale=0.4)
+    # Label
+    cv2.putText(overlay_frame, "R-ARM", (right_section_x, y), 
+                font, 0.45, text_gray, 1)
     
-    # Calculate position for right text to align to right side
-    (text_width, _), _ = cv2.getTextSize(full_right, font, 0.4, 1)
-    right_text_x = width - text_width - 10
-    add_text_with_bg(overlay_frame, full_right, (right_text_x, bottom_y), gt_color, font_scale=0.4)
+    # GT info (compact horizontal layout)
+    gt_text = f"GT: {right_verb} -> {right_target}"
+    cv2.putText(overlay_frame, gt_text, (right_section_x + 55, y), 
+                font, 0.4, gt_color, 1)
+    
+    # Prediction (if available)
+    y += 20
+    if right_pred_verb and right_pred_target:
+        pred_text = f"PR: {right_pred_verb} -> {right_pred_target}"
+        cv2.putText(overlay_frame, pred_text, (right_section_x + 55, y), 
+                    font, 0.4, pred_color, 1)
+    else:
+        cv2.putText(overlay_frame, "PR: ----", (right_section_x + 55, y), 
+                    font, 0.4, text_gray, 1)
+    
+    # ===== BOTTOM BAR: Status indicators (minimal) =====
+    bottom_bar_height = 25
+    bottom_y = height - bottom_bar_height
+    
+    # Semi-transparent bottom bar
+    overlay = overlay_frame.copy()
+    cv2.rectangle(overlay, (0, bottom_y), (width, height), header_bg, -1)
+    cv2.addWeighted(overlay, 0.75, overlay_frame, 0.25, 0, overlay_frame)
+    
+    # Divider line
+    cv2.line(overlay_frame, (0, bottom_y), (width, bottom_y), divider_color, 1)
+    
+    # Compact status: L | R
+    status_y = height - 8
+    status_left = f"L: {left_verb}({left_target})"
+    status_right = f"R: {right_verb}({right_target})"
+    
+    # Truncate if needed
+    max_len = 40
+    if len(status_left) > max_len:
+        status_left = status_left[:max_len-3] + "..."
+    if len(status_right) > max_len:
+        status_right = status_right[:max_len-3] + "..."
+    
+    cv2.putText(overlay_frame, status_left, (10, status_y), 
+                font, 0.35, gt_color, 1)
+    
+    (sw, _), _ = cv2.getTextSize(status_right, font, 0.35, 1)
+    cv2.putText(overlay_frame, status_right, (width - sw - 10, status_y), 
+                font, 0.35, gt_color, 1)
 
     return overlay_frame
 
