@@ -53,7 +53,7 @@ from datasets.peg_and_ring_workflow import (
 )
 
 # Environment setup
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # Backbone imports
 try:
@@ -1246,7 +1246,7 @@ def main():
         seq_len=SEQ_LEN,
         stride=STRIDE,
         time_unit=TIME_UNIT,
-        augment=True,
+        augment=False,
         force_triplets=True
     )
     

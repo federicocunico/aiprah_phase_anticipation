@@ -17,3 +17,6 @@ stuff_to_sort/
 test_time_phase.png
 val_time_phase.png
 *.pth
+
+debug_outputs/
+training_plots/
